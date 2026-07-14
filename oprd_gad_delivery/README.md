@@ -1,5 +1,7 @@
 # OPRD + GAD — Combined White-box Cross-arch Distillation
 
+> 中文版: [README.zh.md](README.zh.md)
+
 Merges **GAD** (Generative Adversarial Distillation — a discriminator reward optimized by GRPO)
 into the **OPRD** (On-Policy Representation Distillation — teacher hidden-state MSE) codebase.
 
