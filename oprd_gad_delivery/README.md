@@ -25,24 +25,42 @@ L_actor =  rep_distillation_coef * MSE(h_student, sg(h_teacher))     # OPRD — 
 | `scripts/gad_oprd_distillation.sh` | **Combined OPRD+GAD** launcher. |
 | `scripts/baseline_oprd_only.sh` | OPRD-only baseline. |
 | `scripts/baseline_opd.sh` | OPD (and OPD+OPRD) baseline. |
+| `scripts/smoke_debug.sh` | Tiny single-GPU smoke + post-mortem-pdb debug run (~3 steps). |
 | `scripts/build_teacher_response_parquet.py` | Helper to add the `teacher_response` column. |
 | `tests/test_gad_components.py` | CPU unit tests (BT loss + last-token masking); runs without GPU. |
+| `modified_files_full/` | The 10 modified files as **complete files** (read-only reference; the patch is what you apply). |
 
 ## Setup (on the GPU machine)
 
+The OPRD fork uses a **newer stack than GAD** (Python 3.12 / vLLM 0.11 / torch 2.8 /
+flash-attn 2.8.1) — do **not** reuse GAD's docker image.
+
 ```bash
-# 1. Clone the OPRD fork at the base commit the patch targets
+# 1. Get the source = clone the OPRD fork + apply our patch
 git clone https://github.com/ShenzhiYang2000/OPRD.git
-cd OPRD && git checkout 93816fd            # verl 0.7.0.dev base
-
-# 2. Apply the merge (run from the OPRD repo root — patch paths are verl/verl/... and on_policy_distillation.sh)
+cd OPRD
+git checkout 93816fd                                     # verl 0.7.0.dev base the patch targets
+# run git apply from the OPRD repo ROOT (patch paths are verl/verl/... and on_policy_distillation.sh)
 git apply /path/to/oprd_gad_delivery/oprd_gad.patch
+cp /path/to/oprd_gad_delivery/scripts/*.sh .             # launchers, next to on_policy_distillation.sh
 
-# 3. Install (per OPRD README) — verl 0.7.0.dev + vllm + ray + flash-attn, etc.
+# 2. Environment (OPRD's official steps)
+conda create -n verl python==3.12 -y
+conda activate verl
+cd verl/
+USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh # vllm0.11 / torch2.8 / flash-attn2.8.1 / flashinfer / ray ...
+pip install math-verify
+pip install -e . --no-deps                               # make `verl` importable for `python -m verl.trainer.main_ppo`
+cd ..
 
-# 4. Drop the launchers next to on_policy_distillation.sh
-cp /path/to/oprd_gad_delivery/scripts/*.sh .
+# 3. Model & data paths
+export MODEL_DIR=/path/to/models
+export DATA_DIR=/path/to/datasets
 ```
+
+Notes:
+- `USE_MEGATRON=0` — we use FSDP, not Megatron (skips hard-to-build deps).
+- Real experiments need **multiple GPUs** (scripts default to 8); a single GPU is only enough for the smoke run.
 
 ## Data
 
@@ -65,6 +83,67 @@ bash baseline_oprd_only.sh
 bash baseline_opd.sh
 ```
 
+## Debugging
+
+Three levels, easiest first.
+
+**Level 0 — pure algorithm logic (any machine, no GPU/ray needed):**
+```bash
+python3 -m pdb tests/test_gad_components.py
+```
+Single-step the Bradley-Terry discriminator loss and the last-token scoring mask. The `real-import`
+test in that file also does a numeric parity check against the *actual* verl function — it SKIPs on a
+bare CPU box and PASSES once the env is installed.
+
+**Level 1 — import smoke (after env install):**
+```bash
+python -c "from verl.trainer.ppo.core_algos import compute_discriminator_loss; \
+           from verl.workers.critic.dp_critic import DataParallelPPOCritic; print('import ok')"
+```
+
+**Level 2 — single-GPU end-to-end debug (the main one):**
+```bash
+bash smoke_debug.sh     # 1 GPU, ~0.5B models, resp_len=512, rollout.n=2, 3 steps
+```
+`smoke_debug.sh` presets `RAY_DEBUG_POST_MORTEM=1` + `HYDRA_FULL_ERROR=1`, so **any exception inside a
+worker drops into pdb** (post-mortem) — the most useful way to debug a verl crash. Requires a training
+parquet that already has the `teacher_response` column.
+
+**Breakpoints & the Ray multiprocess caveat.** verl runs under Ray:
+- Code in `ray_trainer.fit()` (incl. **our reward injection** `if use_gad_discriminator:`) runs in the
+  **driver** process — ordinary `breakpoint()` / IDE breakpoints **hit**.
+- Code in `dp_critic` / `dp_actor` runs in **Ray worker** subprocesses — main-process breakpoints **do not
+  hit**. To break there: (1) rely on `RAY_DEBUG_POST_MORTEM=1` (already set), or (2) put `breakpoint()` in
+  the code, run with `export RAY_DEBUG=legacy`, and attach from another terminal via `ray debug`.
+- For the loss *math*, prefer Level 0 (identical logic, single-step on CPU), then confirm wiring at Level 2.
+
+Suggested breakpoints (after applying the patch):
+
+| Where | What to inspect |
+|---|---|
+| `ray_trainer.py` → `if use_gad_discriminator:` (compute_values block) | `D(y)` becomes `token_level_scores` |
+| `dp_critic.py: update_critic` (`if use_gad:` branch) | `d_loss` / `d_acc`, teacher vs student scores |
+| `dp_critic.py: _slice_response_values` | only the last real response token is nonzero |
+| `dp_actor.py` (near `policy_loss = pg_loss`) | `gad_coef·PG + rep_distillation_coef·rep` add cleanly |
+
+### Smoke/debug knobs exposed by the patch
+
+`on_policy_distillation.sh` now honors these env vars (defaults unchanged when unset) so a single-GPU
+run needs no editing, and forwards extra Hydra overrides via `"$@"`:
+
+| env | default | smoke value |
+|---|---|---|
+| `N_GPUS_PER_NODE` | 8 | 1 |
+| `MAX_RESP_LENGTH` | 16384 | 512 |
+| `N_RESPONSES` (GRPO group) | 2 | 2 |
+| `MINI_BATCH_SIZE` | 8 | 2 |
+| `TEST_FREQ` / `SAVE_FREQ` | 2 / 200 | large (skip) |
+
+Example one-off override (appended, so keys not already set by the script — e.g. step limit):
+```bash
+bash smoke_debug.sh trainer.total_training_steps=3   # already the default inside smoke_debug.sh
+```
+
 ## Architecture (four coexisting workers, no collision)
 
 | worker | role | gate |
@@ -83,14 +162,14 @@ bash baseline_opd.sh
 - `workers/rollout/vllm_rollout/vllm_rollout_spmd.py` — build `teacher_input_ids/attention_mask/position_ids` (guarded).
 - `trainer/ppo/ray_trainer.py` — pop `teacher_response` into the gen batch; under GAD, `D(y_student)` → `token_level_scores` → GRPO advantage (external reward_fn skipped).
 - `workers/actor/dp_actor.py` — scale the PG term by `gad_coef` (rep MSE term unchanged).
-- `on_policy_distillation.sh` — `GAD_ARGS` block (off by default → baselines unchanged).
+- `on_policy_distillation.sh` — `GAD_ARGS` block (off by default → baselines unchanged); exposes `N_GPUS_PER_NODE / MAX_RESP_LENGTH / N_RESPONSES / TEST_FREQ / SAVE_FREQ` as env vars (defaults unchanged) and forwards `"$@"` to the python call for ad-hoc Hydra overrides.
 
 All GAD behavior is gated behind `use_gad_discriminator` + `adv_estimator=grpo`; OPRD-only and OPD are byte-for-byte unchanged when GAD is off.
 
 ## Verification status
 
 - **Done (CPU/static):** `python3 tests/test_gad_components.py` passes (BT loss value/gradient, last-token masking); all edited `.py` compile; `bash -n` on all scripts; patch applies cleanly on base `93816fd`.
-- **Requires GPU (not yet run — no GPU on the authoring machine):** FSDP co-sharding of actor + teacher(RM) + discriminator(critic); vLLM rollout with teacher sequences; end-to-end reward → advantage → PG + rep MSE; OOM behavior. **First GPU gate:** tiny smoke config (student/teacher/discriminator ≈0.5B, `rollout.n=2`, 3 steps) before the real 4B→1.5B run.
+- **Requires GPU (not yet run — no GPU on the authoring machine):** FSDP co-sharding of actor + teacher(RM) + discriminator(critic); vLLM rollout with teacher sequences; end-to-end reward → advantage → PG + rep MSE; OOM behavior. **First GPU gate:** `bash scripts/smoke_debug.sh` (≈0.5B models, `rollout.n=2`, 3 steps) before the real 4B→1.5B run.
 
 ## Tuning / sharp edges (see plan for detail)
 

@@ -52,14 +52,14 @@ export GRPO_OUTCOME_WEIGHT=1.0
 
 # DeepMath-103K
 export MAX_PROMPT_LENGTH=2048
-export MAX_RESP_LENGTH=16384  # TODO: 31744 /15360 / 7168 / 3072 / 5120
+export MAX_RESP_LENGTH=${MAX_RESP_LENGTH:-16384}  # TODO: 31744 /15360 / 7168 / 3072 / 5120
 export MAX_VAL_RESP_LENGTH=15360 # TODO: 15360 / 7168 / 3072
 export MAX_MODEL_LEN=$(( MAX_RESP_LENGTH + MAX_PROMPT_LENGTH > MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ? MAX_RESP_LENGTH + MAX_PROMPT_LENGTH : MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ))
 export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-8} # TODO: 1 / 8 / 16 / 32 / 64 (default 64)
 export TEMPERATURE=${TEMPERATURE:-1.0} # TODO: 0.6 / 0.8 / 1.0 / 1.2 (default 1.0)
 export TEACHER_TEMPERATURE=${TEACHER_TEMPERATURE:-1.0} # Teacher logits temperature (default 1.0, no scaling)
 export REPETITION_PENALTY=${REPETITION_PENALTY:-1.0} # TODO: 1.0 / 1.1 / 1.2 (default 1.0, no penalty)
-export N_RESPONSES=2 # TODO: 4 / 8 / 16 / 32 (default: 8)
+export N_RESPONSES=${N_RESPONSES:-2} # TODO: 4 / 8 / 16 / 32 (default: 8)
 export LOG_PROB_TOP_K=${LOG_PROB_TOP_K:-16} # 0 represents no top-k sampling
 export TOP_K_STRATEGY=${TOP_K_STRATEGY:-"only_stu"} # "only_stu" or "only_tch" or "intersection" or "union" or "union-intersection"
 export REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-"student_p"} # "student_p" or "teacher_p" or "none"
@@ -330,13 +330,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.validation_data_dir=${PROJECT_PATH}/logs/validation_log/$EXPERIMENT_NAME \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=${N_GPUS_PER_NODE:-8} \
     trainer.nnodes=1 \
-    trainer.save_freq=200 \
-    trainer.test_freq=2 \
+    trainer.save_freq=${SAVE_FREQ:-200} \
+    trainer.test_freq=${TEST_FREQ:-2} \
     trainer.total_epochs=1 \
     trainer.default_local_dir="$CKPT_PATH" \
     trainer.is_plot=$IS_PLOT \
+    "$@"
 
 # Log the end time for local runs.
 if [ -z "$SLURM_JOB_ID" ]; then
