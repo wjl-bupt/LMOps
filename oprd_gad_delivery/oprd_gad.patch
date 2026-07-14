@@ -1,0 +1,483 @@
+diff --git a/on_policy_distillation.sh b/on_policy_distillation.sh
+index f703198..1baf39c 100644
+--- a/on_policy_distillation.sh
++++ b/on_policy_distillation.sh
+@@ -197,6 +197,36 @@ if [ "$LR_SCHEDULER" = "cosine" ]; then
+     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03"
+ fi
+ 
++# --- GAD (Generative Adversarial Distillation): auxiliary adversarial reward ---
++# When USE_GAD_DISCRIMINATOR=True the critic is trained as a Bradley-Terry discriminator
++# (teacher response > student response) and its per-sequence score D(y) is used as the reward,
++# optimized by GRPO. This ADDS a lambda*PG term on top of the OPRD representation MSE.
++# The training parquet must contain a `teacher_response` TEXT column. Off by default -> OPRD/OPD
++# baselines are byte-for-byte unchanged.
++export USE_GAD_DISCRIMINATOR=${USE_GAD_DISCRIMINATOR:-False}
++export GAD_COEF=${GAD_COEF:-1.0}                                   # lambda on the adversarial PG term
++export GAD_GATE_PG=${GAD_GATE_PG:-True}                            # False -> rep-MSE only (drop PG)
++export DISCRIMINATOR_MODEL_PATH=${DISCRIMINATOR_MODEL_PATH:-$ACTOR_MODEL_PATH}  # discriminator backbone
++export CRITIC_LR=${CRITIC_LR:-1e-6}
++export CRITIC_MICRO_BSZ=${CRITIC_MICRO_BSZ:-1}
++
++GAD_ARGS=""
++if [ "$USE_GAD_DISCRIMINATOR" = "True" ]; then
++    GAD_ARGS="+actor_rollout_ref.actor.use_gad_discriminator=True \
++    +actor_rollout_ref.actor.gad_coef=$GAD_COEF \
++    +actor_rollout_ref.actor.gad_gate_pg=$GAD_GATE_PG \
++    critic.enable=True \
++    critic.strategy=fsdp \
++    critic.use_gad_discriminator=True \
++    critic.use_dynamic_bsz=False \
++    critic.ppo_micro_batch_size_per_gpu=$CRITIC_MICRO_BSZ \
++    critic.optim.lr=$CRITIC_LR \
++    critic.grad_clip=0.2 \
++    critic.model.path=$DISCRIMINATOR_MODEL_PATH \
++    critic.model.use_remove_padding=True \
++    critic.model.fsdp_config.param_offload=True"
++fi
++
+ PPO_MAX_TOKEN_LEN_PER_GPU=$(( ((1024 + MAX_RESP_LENGTH) > 32768) ? (1024 + MAX_RESP_LENGTH) : 32768))
+ echo "PPO_MAX_TOKEN_LEN_PER_GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
+ 
+@@ -230,6 +260,7 @@ python3 -m verl.trainer.main_ppo \
+     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$PPO_MAX_TOKEN_LEN_PER_GPU \
+     actor_rollout_ref.actor.ulysses_sequence_parallel_size=$PARALLEL_SIZE \
+     $KL_ARGS \
++    $GAD_ARGS \
+     actor_rollout_ref.actor.loss_agg_mode=$LOSS_AGG_MODE \
+     +actor_rollout_ref.actor.use_rep_distillation=$USE_REP_DISTILLATION \
+     +actor_rollout_ref.actor.rep_distillation_coef=$REP_DISTILLATION_COEF \
+diff --git a/verl/verl/trainer/config/critic/critic.yaml b/verl/verl/trainer/config/critic/critic.yaml
+index f201a34..8fa7cde 100644
+--- a/verl/verl/trainer/config/critic/critic.yaml
++++ b/verl/verl/trainer/config/critic/critic.yaml
+@@ -79,6 +79,11 @@ cliprange_value: 0.5
+ # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
+ loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
+ 
++# GAD: train the critic as a Bradley-Terry discriminator (teacher > student) instead of a
++# PPO value function; its per-sequence score D(y) is used as the reward. Keep in sync with
++# actor_rollout_ref.actor.use_gad_discriminator.
++use_gad_discriminator: ${oc.select:actor_rollout_ref.actor.use_gad_discriminator,false}
++
+ # checkpoint configs
+ checkpoint:
+ 
+diff --git a/verl/verl/trainer/ppo/core_algos.py b/verl/verl/trainer/ppo/core_algos.py
+index 5734eef..e018f18 100644
+--- a/verl/verl/trainer/ppo/core_algos.py
++++ b/verl/verl/trainer/ppo/core_algos.py
+@@ -1631,6 +1631,37 @@ def compute_value_loss(
+     return vf_loss, vf_clipfrac
+ 
+ 
++def compute_discriminator_loss(
++    student_vpreds: torch.Tensor,
++    teacher_vpreds: torch.Tensor,
++    response_mask: torch.Tensor,
++    teacher_response_mask: torch.Tensor,
++) -> torch.Tensor:
++    """Bradley-Terry discriminator loss for GAD (Generative Adversarial Distillation).
++
++    The critic is hacked into a discriminator: it emits a per-token scalar, of which only
++    the last real response token is kept (all others zeroed upstream in dp_critic). Summing
++    over the response therefore yields a single sequence-level score D(y). This loss trains the
++    discriminator to score the teacher response higher than the student response:
++
++        L_D = - E[ log sigmoid( D(y_teacher) - D(y_student) ) ]
++
++    Args:
++        student_vpreds (torch.Tensor): (bsz, response_length) student per-token scores
++            (nonzero only at the last real token).
++        teacher_vpreds (torch.Tensor): (bsz, teacher_response_length) teacher per-token scores.
++        response_mask (torch.Tensor): (bsz, response_length) student response mask.
++        teacher_response_mask (torch.Tensor): (bsz, teacher_response_length) teacher response mask.
++
++    Returns:
++        torch.Tensor: scalar Bradley-Terry discriminator loss.
++    """
++    teacher_reward = torch.sum(teacher_vpreds * teacher_response_mask, dim=-1)
++    student_reward = torch.sum(student_vpreds * response_mask, dim=-1)
++    d_loss = -torch.nn.functional.logsigmoid(teacher_reward - student_reward).mean()
++    return d_loss
++
++
+ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
+     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
+     kl penalty compute method for unbiased KL gradient estimation.
+diff --git a/verl/verl/trainer/ppo/ray_trainer.py b/verl/verl/trainer/ppo/ray_trainer.py
+index 1f54102..001a693 100644
+--- a/verl/verl/trainer/ppo/ray_trainer.py
++++ b/verl/verl/trainer/ppo/ray_trainer.py
+@@ -527,6 +527,10 @@ class RayPPOTrainer:
+ 
+         # pop those keys for generation
+         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
++        # GAD: teacher_response (discriminator's real example) must ride along into the rollout,
++        # where it is repeated by rollout.n and turned into teacher_input_ids/attention_mask/position_ids.
++        if "teacher_response" in batch.batch:
++            batch_keys_to_pop.append("teacher_response")
+         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+         gen_batch = batch.pop(
+             batch_keys=batch_keys_to_pop,
+@@ -1106,6 +1110,7 @@ class RayPPOTrainer:
+                     use_rep_distillation = self.config.actor_rollout_ref.actor.get("use_rep_distillation", False)
+                     use_att_distillation = self.config.actor_rollout_ref.actor.get("use_att_distillation", False)
+                     rep_distillation_only = self.config.actor_rollout_ref.actor.get("rep_distillation_only", False)
++                    use_gad_discriminator = self.config.actor_rollout_ref.actor.get("use_gad_discriminator", False)
+                     reward_extra_infos_dict: dict[str, list] = {}
+ 
+                     # Balance the number of valid tokens across DP ranks.
+@@ -1296,7 +1301,7 @@ class RayPPOTrainer:
+                              batch.batch.pop("overlap_counts")
+ 
+ 
+-                        if not rep_distillation_only:
++                        if not rep_distillation_only and not use_gad_discriminator:
+                             if self.config.reward_model.launch_reward_fn_async:
+                                 future_reward = compute_reward_async.remote(
+                                     data=batch, config=self.config, tokenizer=self.tokenizer
+@@ -1386,6 +1391,12 @@ class RayPPOTrainer:
+                             with marked_timer("values", timing_raw, color="cyan"):
+                                 values = self.critic_wg.compute_values(batch)
+                                 batch = batch.union(values)
++                                if use_gad_discriminator:
++                                    # GAD: the critic is a Bradley-Terry discriminator; its
++                                    # per-sequence score D(y_student) (nonzero only at the last
++                                    # response token) IS the reward. Overrides any reward_fn.
++                                    reward_tensor = batch.batch["values"]
++                                    reward_extra_infos_dict = {}
+ 
+                         with marked_timer("adv", timing_raw, color="brown"):
+                             # we combine with rule-based rm
+diff --git a/verl/verl/utils/dataset/rl_dataset.py b/verl/verl/utils/dataset/rl_dataset.py
+index 870c475..6efc541 100644
+--- a/verl/verl/utils/dataset/rl_dataset.py
++++ b/verl/verl/utils/dataset/rl_dataset.py
+@@ -107,6 +107,7 @@ class RLHFDataset(Dataset):
+         self.video_key = config.get("video_key", "videos")
+         self.image_patch_size = config.get("image_patch_size", 14)
+         self.max_prompt_length = config.get("max_prompt_length", 1024)
++        self.max_response_length = config.get("max_response_length", 1024)
+         self.return_raw_chat = config.get("return_raw_chat", False)
+         self.return_full_prompt = config.get("return_full_prompt", False)
+         self.truncation = config.get("truncation", "error")
+@@ -292,6 +293,7 @@ class RLHFDataset(Dataset):
+         Note that we also return the raw_input_ids so that it can be combined with other chat template
+         """
+         row_dict: dict = self.dataframe[item]
++        teacher_response_text = row_dict.pop("teacher_response", None)
+         messages = self._build_messages(row_dict)
+         model_inputs = {}
+ 
+@@ -416,6 +418,23 @@ class RLHFDataset(Dataset):
+         row_dict["attention_mask"] = attention_mask[0]
+         row_dict["position_ids"] = position_ids[0]
+ 
++        # GAD: tokenize the teacher response (the discriminator's "real" example) with the
++        # student tokenizer, right-padded with eos to max_response_length. Guarded so datasets
++        # without a `teacher_response` column (e.g. validation parquets) are unaffected.
++        if teacher_response_text is not None:
++            teacher_tokenized = self.tokenizer(
++                teacher_response_text, return_tensors="pt", add_special_tokens=False
++            )
++            teacher_response_ids, _ = verl_F.postprocess_data(
++                input_ids=teacher_tokenized["input_ids"],
++                attention_mask=teacher_tokenized["attention_mask"],
++                max_length=self.max_response_length,
++                pad_token_id=self.tokenizer.eos_token_id,  # response -> right-pad with eos
++                left_pad=False,
++                truncation=self.truncation,
++            )
++            row_dict["teacher_response"] = teacher_response_ids[0].long()
++
+         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+         if len(raw_prompt_ids) > self.max_prompt_length:
+             if self.truncation == "left":
+diff --git a/verl/verl/workers/actor/dp_actor.py b/verl/verl/workers/actor/dp_actor.py
+index 11e5dcd..138811a 100644
+--- a/verl/verl/workers/actor/dp_actor.py
++++ b/verl/verl/workers/actor/dp_actor.py
+@@ -1295,6 +1295,16 @@ class DataParallelPPOActor(BasePPOActor):
+                             )
+                             micro_batch_metrics.update(pg_metrics)
+ 
++                            # GAD: scale the adversarial policy-gradient term by lambda (gad_coef).
++                            # Only active when use_gad_discriminator (OPD/PPO baselines untouched).
++                            # gad_gate_pg=False drops the PG term entirely (representation-MSE only).
++                            use_gad = self.config.get("use_gad_discriminator", False)
++                            if use_gad:
++                                pg_scale = self.config.get("gad_coef", 1.0)
++                                if not self.config.get("gad_gate_pg", True):
++                                    pg_scale = 0.0
++                                pg_loss = pg_scale * pg_loss
++
+                             if entropy_coeff != 0:
+                                 entropy_loss = agg_loss(
+                                     loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+diff --git a/verl/verl/workers/config/actor.py b/verl/verl/workers/config/actor.py
+index caf74e4..1dcb99f 100644
+--- a/verl/verl/workers/config/actor.py
++++ b/verl/verl/workers/config/actor.py
+@@ -164,6 +164,12 @@ class ActorConfig(BaseConfig):
+     att_distillation_max_key_len: int = 4096
+     att_distillation_loss: str = "kl"
+     att_distillation_temperature: float = 1.0
++    # GAD (Generative Adversarial Distillation): auxiliary adversarial reward from a
++    # discriminator (the hacked critic). When enabled together with representation
++    # distillation, the actor objective is L = gad_coef * pg_loss + kl + rep_distillation_coef * rep_loss.
++    use_gad_discriminator: bool = False
++    gad_coef: float = 1.0
++    gad_gate_pg: bool = True
+     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+     engine: BaseConfig = field(default_factory=BaseConfig)
+     data_loader_seed = 1
+diff --git a/verl/verl/workers/config/critic.py b/verl/verl/workers/config/critic.py
+index e65eac0..bfe1028 100644
+--- a/verl/verl/workers/config/critic.py
++++ b/verl/verl/workers/config/critic.py
+@@ -78,6 +78,9 @@ class CriticConfig(BaseConfig):
+     shuffle: bool = True
+     cliprange_value: float = 0.5
+     loss_agg_mode: str = "token-mean"
++    # GAD: when True the critic is trained as a Bradley-Terry discriminator (teacher > student)
++    # instead of a PPO value function, and its per-sequence score D(y) is used as the reward.
++    use_gad_discriminator: bool = False
+     ppo_micro_batch_size: Optional[int] = None
+     engine: BaseConfig = field(default_factory=BaseConfig)
+     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
+diff --git a/verl/verl/workers/critic/dp_critic.py b/verl/verl/workers/critic/dp_critic.py
+index 82ef8c9..d1bce35 100644
+--- a/verl/verl/workers/critic/dp_critic.py
++++ b/verl/verl/workers/critic/dp_critic.py
+@@ -50,8 +50,19 @@ class DataParallelPPOCritic(BasePPOCritic):
+         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+         self.device_name = get_device_name()
+ 
+-    def _forward_micro_batch(self, micro_batch):
+-        response_length = micro_batch["responses"].size(-1)
++    def _forward_micro_batch(self, micro_batch, compute_teacher=False):
++        use_gad = self.config.get("use_gad_discriminator", False)
++        if compute_teacher:
++            # GAD: score the teacher response (the "real" example for the discriminator).
++            response_length = micro_batch["teacher_response"].size(-1)
++            input_ids_key, attn_mask_key, pos_ids_key = (
++                "teacher_input_ids",
++                "teacher_attention_mask",
++                "teacher_position_ids",
++            )
++        else:
++            response_length = micro_batch["responses"].size(-1)
++            input_ids_key, attn_mask_key, pos_ids_key = "input_ids", "attention_mask", "position_ids"
+         multi_modal_inputs = {}
+         if "multi_modal_inputs" in micro_batch.keys():
+             from verl.utils.model import extract_multi_modal_inputs
+@@ -59,10 +70,10 @@ class DataParallelPPOCritic(BasePPOCritic):
+             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+ 
+         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+-            input_ids = micro_batch["input_ids"]
++            input_ids = micro_batch[input_ids_key]
+             batch, seqlen = input_ids.shape
+-            attention_mask = micro_batch["attention_mask"]
+-            position_ids = micro_batch["position_ids"]
++            attention_mask = micro_batch[attn_mask_key]
++            position_ids = micro_batch[pos_ids_key]
+             if position_ids.dim() == 3:  # qwen2vl mrope
+                 position_ids = position_ids.transpose(0, 1)
+ 
+@@ -114,7 +125,7 @@ class DataParallelPPOCritic(BasePPOCritic):
+ 
+                 # pad it back
+                 values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
+-                values = values[:, -response_length - 1 : -1]
++                values = self._slice_response_values(values, attention_mask, response_length, use_gad)
+             else:
+                 output = self.critic_module(
+                     input_ids=input_ids,
+@@ -128,9 +139,31 @@ class DataParallelPPOCritic(BasePPOCritic):
+                     values = output[2]
+                 else:
+                     values = output.logits
+-                values = values[:, -response_length - 1 : -1].squeeze(-1)
++                if values.dim() == 3:
++                    values = values.squeeze(-1)
++                values = self._slice_response_values(values, attention_mask, response_length, use_gad)
+             return values
+ 
++    def _slice_response_values(self, values, attention_mask, response_length, use_gad):
++        """Extract per-token response scores from full-sequence critic outputs.
++
++        - Standard PPO value: next-token-aligned response values ``values[:, -L-1:-1]``.
++        - GAD discriminator (use_gad=True): keep ONLY the last real response token's score
++          (all other positions zeroed), so that summing over the response yields the
++          sequence-level score D(y). The last real token index is derived from the response
++          region of the attention mask (handles right-padding).
++        """
++        if not use_gad:
++            return values[:, -response_length - 1 : -1]
++        values = values[:, -response_length:]
++        resp_attn = attention_mask[:, -response_length:]
++        resp_len = resp_attn.sum(dim=1).long()
++        last_idx = (resp_len - 1).clamp(min=0)
++        last_mask = torch.zeros_like(resp_attn, dtype=torch.bool)
++        batch_indices = torch.arange(resp_attn.size(0), device=resp_attn.device)
++        last_mask[batch_indices, last_idx] = True
++        return values * last_mask.type_as(values)
++
+     def _optimizer_step(self):
+         assert self.config.grad_clip is not None
+ 
+@@ -193,8 +226,31 @@ class DataParallelPPOCritic(BasePPOCritic):
+         # make sure we are in training mode
+         self.critic_module.train()
+         metrics = {}
+-
+-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
++        use_gad = self.config.get("use_gad_discriminator", False)
++
++        if use_gad:
++            # GAD discriminator: needs both student and teacher sequences; no PPO values/returns.
++            select_keys = [
++                "input_ids",
++                "responses",
++                "response_mask",
++                "attention_mask",
++                "position_ids",
++                "teacher_input_ids",
++                "teacher_response",
++                "teacher_attention_mask",
++                "teacher_position_ids",
++            ]
++        else:
++            select_keys = [
++                "input_ids",
++                "responses",
++                "response_mask",
++                "attention_mask",
++                "position_ids",
++                "values",
++                "returns",
++            ]
+         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+ 
+@@ -222,6 +278,41 @@ class DataParallelPPOCritic(BasePPOCritic):
+                     micro_batch_metrics = {}
+                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                     response_mask = model_inputs["response_mask"]
++
++                    if self.config.use_dynamic_bsz:
++                        # relative to the dynamic bsz
++                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
++                    else:
++                        loss_scale_factor = 1 / self.gradient_accumulation
++
++                    if use_gad:
++                        # Bradley-Terry discriminator update: teacher response scored higher than student.
++                        student_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=False)
++                        teacher_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=True)
++                        teacher_resp_len = model_inputs["teacher_response"].size(-1)
++                        teacher_response_mask = model_inputs["teacher_attention_mask"][:, -teacher_resp_len:]
++                        d_loss = core_algos.compute_discriminator_loss(
++                            student_vpreds=student_vpreds,
++                            teacher_vpreds=teacher_vpreds,
++                            response_mask=response_mask,
++                            teacher_response_mask=teacher_response_mask,
++                        )
++                        student_score = torch.sum(student_vpreds * response_mask, dim=-1)
++                        teacher_score = torch.sum(teacher_vpreds * teacher_response_mask, dim=-1)
++                        d_acc = (teacher_score > student_score).float().mean()
++                        loss = d_loss * loss_scale_factor
++                        loss.backward()
++                        micro_batch_metrics.update(
++                            {
++                                "critic/d_loss": d_loss.detach().item() * loss_scale_factor,
++                                "critic/d_acc": d_acc.detach().item(),
++                                "critic/student_score_mean": student_score.mean().detach().item(),
++                                "critic/teacher_score_mean": teacher_score.mean().detach().item(),
++                            }
++                        )
++                        append_to_dict(metrics, micro_batch_metrics)
++                        continue
++
+                     values = model_inputs["values"]
+                     returns = model_inputs["returns"]
+ 
+@@ -234,13 +325,7 @@ class DataParallelPPOCritic(BasePPOCritic):
+                         cliprange_value=self.config.cliprange_value,
+                         loss_agg_mode=self.config.loss_agg_mode,
+                     )
+-                    if self.config.use_dynamic_bsz:
+-                        # relative to the dynamic bsz
+-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+-                        loss = vf_loss * loss_scale_factor
+-                    else:
+-                        loss_scale_factor = 1 / self.gradient_accumulation
+-                        loss = vf_loss * loss_scale_factor
++                    loss = vf_loss * loss_scale_factor
+ 
+                     loss.backward()
+ 
+diff --git a/verl/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/verl/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index 256ae0c..d1af98d 100644
+--- a/verl/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/verl/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -444,6 +444,29 @@ class vLLMRollout(BaseRollout):
+ 
+             seq = torch.cat([idx, response], dim=-1)
+ 
++        # GAD: build the teacher sequence (prompt + teacher_response) for the discriminator.
++        # teacher_response rides in prompts.batch and was already repeated by rollout.n
++        # (interleave=True) in the trainer, so it is row-aligned with idx here. Guarded so
++        # rollouts without a teacher_response (e.g. validation) are unaffected. Uses the
++        # still prompt-level position_ids/attention_mask BEFORE the student block overwrites them.
++        has_teacher_response = "teacher_response" in prompts.batch
++        if has_teacher_response:
++            teacher_response = prompts.batch["teacher_response"]
++            teacher_seq = torch.cat([idx, teacher_response], dim=-1)
++            teacher_response_length = teacher_response.size(1)
++            teacher_delta_position_id = torch.arange(1, teacher_response_length + 1, device=position_ids.device)
++            teacher_delta_position_id = teacher_delta_position_id.unsqueeze(0).expand(batch_size, -1)
++            if position_ids.dim() == 3:  # qwen2vl mrope
++                teacher_delta_position_id = teacher_delta_position_id.view(batch_size, 1, -1).expand(
++                    batch_size, position_ids.size(1), -1
++                )
++            teacher_response_position_ids = position_ids[..., -1:] + teacher_delta_position_id
++            teacher_position_ids = torch.cat([position_ids, teacher_response_position_ids], dim=-1)
++            teacher_response_attention_mask = get_response_mask(
++                response_id=teacher_response, eos_token=eos_token_id, dtype=attention_mask.dtype
++            )
++            teacher_attention_mask = torch.cat((attention_mask, teacher_response_attention_mask), dim=-1)
++
+         response_length = response.size(1)
+         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+         delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+@@ -462,14 +485,20 @@ class vLLMRollout(BaseRollout):
+         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+ 
+         # all the tp ranks should contain the same data here. data in all ranks are valid
++        batch_dict = {
++            "prompts": idx,
++            "responses": response,
++            "input_ids": seq,  # here input_ids become the whole sentences
++            "attention_mask": attention_mask,
++            "position_ids": position_ids,
++        }
++        if has_teacher_response:
++            batch_dict["teacher_response"] = teacher_response
++            batch_dict["teacher_input_ids"] = teacher_seq  # prompt + teacher_response
++            batch_dict["teacher_attention_mask"] = teacher_attention_mask
++            batch_dict["teacher_position_ids"] = teacher_position_ids
+         batch = TensorDict(
+-            {
+-                "prompts": idx,
+-                "responses": response,
+-                "input_ids": seq,  # here input_ids become the whole sentences
+-                "attention_mask": attention_mask,
+-                "position_ids": position_ids,
+-            },
++            batch_dict,
+             batch_size=batch_size,
+         )
+         if self.config.calculate_log_probs:
