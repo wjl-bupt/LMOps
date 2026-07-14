@@ -23,12 +23,15 @@ L_actor =  rep_distillation_coef * MSE(h_student, sg(h_teacher))     # OPRD — 
 
 | Path | What |
 |---|---|
+| `bootstrap_oprd_gad.sh` | **One-command** setup+run: clone OPRD@base → apply merge → build conda env → self-check → run. |
+| `BASE_COMMIT` | The OPRD base commit the merge is pinned to (read by the bootstrap script). |
 | `oprd_gad.patch` | All source changes, as a `git apply`-able patch against the OPRD fork (base commit `93816fd`). |
 | `scripts/gad_oprd_distillation.sh` | **Combined OPRD+GAD** launcher. |
 | `scripts/baseline_oprd_only.sh` | OPRD-only baseline. |
 | `scripts/baseline_opd.sh` | OPD (and OPD+OPRD) baseline. |
 | `scripts/smoke_debug.sh` | Tiny single-GPU smoke + post-mortem-pdb debug run (~3 steps). |
 | `scripts/build_teacher_response_parquet.py` | Helper to add the `teacher_response` column. |
+| `scripts/download_data.sh` | Download DAPO-Math-17k (train) + AIME24 (eval), verl-format. |
 | `tests/test_gad_components.py` | CPU unit tests (BT loss + last-token masking); runs without GPU. |
 | `modified_files_full/` | The 10 modified files as **complete files** (read-only reference; the patch is what you apply). |
 
@@ -36,6 +39,24 @@ L_actor =  rep_distillation_coef * MSE(h_student, sg(h_teacher))     # OPRD — 
 
 The OPRD fork uses a **newer stack than GAD** (Python 3.12 / vLLM 0.11 / torch 2.8 /
 flash-attn 2.8.1) — do **not** reuse GAD's docker image.
+
+### One-command bootstrap (recommended)
+
+From this delivery folder on the GPU machine:
+
+```bash
+bash bootstrap_oprd_gad.sh          # clone OPRD@BASE_COMMIT + apply merge + build conda env + self-check
+# then, after preparing data with a teacher_response column:
+RUN_SCRIPT=smoke_debug.sh bash bootstrap_oprd_gad.sh run
+```
+
+It clones OPRD pinned to `BASE_COMMIT`, **overlays** the merge (file-copy — CRLF/patch-context proof),
+copies the launchers, builds the `verl` conda env, and runs the checks. Idempotent and stage-selectable:
+`bash bootstrap_oprd_gad.sh clone patch | env | check | run | all`. Override via env:
+`TARGET_DIR` (default `$HOME/OPRD_gad`), `CONDA_ENV` (`verl`), `PATCH_MODE` (`overlay`|`apply`),
+`RUN_SCRIPT`, `RUN_ARGS`, `OPRD_REPO_URL`.
+
+The manual steps below do the same thing by hand.
 
 ```bash
 # 1. Get the source = clone the OPRD fork + apply our patch
@@ -85,11 +106,46 @@ Notes:
 
 ## Data
 
-The combined run's training parquet needs a **`teacher_response` TEXT column** (the white-box
-teacher's own solution to each prompt) — the discriminator's "real" example. See
-`scripts/build_teacher_response_parquet.py` (wire in offline vLLM teacher generation).
-Validation parquets do **not** need it (all reads are guarded). `teacher_response` is tokenized
+**Train = DAPO-Math-17k; eval = AIME24** — both already in **verl format** on HuggingFace (no
+preprocessing). Note AIME24 is a *validation* benchmark, not training data.
+
+**Schema (verl format).** Each row:
+```python
+{
+  "data_source": "math_dapo",
+  "prompt": [{"role": "user", "content": "...  output the final answer within \\boxed{}."}],  # chat list; prompt_key="prompt"
+  "ability": "math",
+  "reward_model": {"style": "rule", "ground_truth": "42"},   # used by validation & the OPD/OPRD baselines
+  "extra_info": {"index": 0, "split": "train"},
+  "teacher_response": "We start by ... therefore \\boxed{42}."   # TRAIN-only, added for GAD (discriminator's "real" example)
+}
+```
+Validation parquets (AIME24) do **not** need `teacher_response` (all reads are guarded). It is tokenized
 with the **student** tokenizer and right-padded with eos to `data.max_response_length`.
+
+**Download** (run from the OPRD repo root so `../datasets` resolves; idempotent):
+```bash
+bash scripts/download_data.sh
+#  -> ../datasets/dapo-math-17k.parquet   and   ../datasets/test_data/AIME24/test.parquet
+export TEST_FILE='["../datasets/test_data/AIME24/test.parquet"]'   # tell the launcher to eval on AIME24
+```
+(equivalently, `verl/recipe/dapo/prepare_dapo_data.sh` wgets the same two HF parquets.)
+
+**Add the `teacher_response` column (GAD only):**
+```bash
+python3 scripts/build_teacher_response_parquet.py \
+  --in ../datasets/dapo-math-17k.parquet --out ../datasets/dapo-math-17k-gad.parquet \
+  --teacher $REWARD_MODEL_PATH
+TRAIN_DATASET=../datasets/dapo-math-17k-gad.parquet bash gad_oprd_distillation.sh
+```
+
+**Two gotchas:**
+- The launchers default to `data.truncation=error`; an over-long `teacher_response` will crash. Either
+  size `data.max_response_length` to cover teacher solutions, or pass `data.truncation=right` (note:
+  right-truncation drops the trailing `\boxed{}` answer — prefer enlarging the length).
+- GAD's reward is `D(y)`, **not** `ground_truth` (we skip the external reward_fn), but keep
+  `reward_model.ground_truth` in the parquet — validation and the OPD/OPRD baselines need it.
+  `build_teacher_response_parquet.py` **adds** a column; it does not overwrite the others.
 
 ## Run
 
