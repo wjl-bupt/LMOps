@@ -64,6 +64,25 @@ Notes:
 - `USE_MEGATRON=0` — we use FSDP, not Megatron (skips hard-to-build deps).
 - Real experiments need **multiple GPUs** (scripts default to 8); a single GPU is only enough for the smoke run.
 
+### CUDA / driver compatibility (target box: driver 535.161.08, "CUDA 12.4", 8× H20 96 GB)
+
+- The `CUDA Version: 12.4` shown by `nvidia-smi` is the **maximum CUDA runtime the driver supports**, not a
+  hard cap. PyTorch/vLLM ship their **own** CUDA runtime; thanks to **CUDA 12.x minor-version compatibility**,
+  the stack this script installs (torch 2.8 with a cu126/cu128 build, vLLM 0.11) runs fine on a 12.4 (r535)
+  driver. H20 (Hopper, `sm_90`) is fully supported.
+- So install the script **as-is** — no special CUDA-12.4 build is needed, and do **not** install a system
+  CUDA 12.4 toolkit (torch ignores it; `USE_MEGATRON=0` avoids the from-source builds that would need one).
+- Verify right after install:
+  ```bash
+  python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+  python -c "import flash_attn, vllm; print('flash_attn', flash_attn.__version__, '| vllm', vllm.__version__)"
+  ```
+- Only if you hit `CUDA driver version is insufficient for CUDA runtime version` (unlikely on r535): reinstall
+  torch's lower CUDA-minor build of the **same** version, e.g.
+  `pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126`, and match the flash-attn /
+  flashinfer / vLLM builds to it. Prefer this only if the default actually fails.
+- 8× H20 (96 GB) is ample: run real experiments on all 8 (`N_GPUS_PER_NODE=8`, the script default); the smoke run uses 1.
+
 ## Data
 
 The combined run's training parquet needs a **`teacher_response` TEXT column** (the white-box

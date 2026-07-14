@@ -62,6 +62,24 @@ export DATA_DIR=/path/to/datasets
 - `USE_MEGATRON=0` —— 我们用 FSDP,不用 Megatron(省掉难装的依赖)。
 - 真实实验需要**多卡**(脚本默认 8 卡);单卡只够冒烟。
 
+### CUDA / 驱动兼容性(目标机:驱动 535.161.08、"CUDA 12.4"、8× H20 96 GB)
+
+- `nvidia-smi` 里的 `CUDA Version: 12.4` 是**驱动能支持的最高 CUDA runtime**,不是硬上限。PyTorch/vLLM
+  自带**各自的** CUDA runtime;靠 **CUDA 12.x 次版本兼容(minor-version compatibility)**,脚本装的
+  torch 2.8(cu126/cu128 构建)+ vLLM 0.11 在 12.4(r535)驱动上能正常跑。H20(Hopper,`sm_90`)完全受支持。
+- 所以**按脚本原样装即可**——不需要专门的 CUDA-12.4 构建;也**不要**装系统级 CUDA 12.4 toolkit
+  (torch 用不到;`USE_MEGATRON=0` 已避开需要从源码编译、才会用到系统 toolkit 的部分)。
+- 装完立刻验证:
+  ```bash
+  python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+  python -c "import flash_attn, vllm; print('flash_attn', flash_attn.__version__, '| vllm', vllm.__version__)"
+  ```
+- 仅当遇到 `CUDA driver version is insufficient for CUDA runtime version`(在 r535 上基本不会)时:重装**同版本**
+  但更低 CUDA-minor 的 torch 构建,例如
+  `pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126`,并让 flash-attn / flashinfer /
+  vLLM 的构建与之匹配。只在默认真的失败时才这么做。
+- 8× H20(96 GB)非常充裕:真实实验直接用满 8 卡(`N_GPUS_PER_NODE=8`,脚本默认);冒烟用 1 卡。
+
 ## 数据
 
 组合训练的 parquet 需要一列 **`teacher_response` 文本列**(白盒教师对每题的解题文本)——
