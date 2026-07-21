@@ -431,7 +431,7 @@ class RLHFDataset(Dataset):
                 max_length=self.max_response_length,
                 pad_token_id=self.tokenizer.eos_token_id,  # response -> right-pad with eos
                 left_pad=False,
-                truncation=self.truncation,
+                truncation="right",  # teacher_response is a reference; truncate if > max_response_length (never 'error')
             )
             row_dict["teacher_response"] = teacher_response_ids[0].long()
 

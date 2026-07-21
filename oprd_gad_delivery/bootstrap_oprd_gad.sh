@@ -20,7 +20,7 @@
 #   RUN_SCRIPT=gad_oprd_distillation.sh bash bootstrap_oprd_gad.sh run
 #
 # Config (override via env):
-#   TARGET_DIR      where to clone OPRD          (default: $HOME/OPRD_gad)
+#   TARGET_DIR      where to clone OPRD          (default: <delivery_dir>/.oprd — self-contained)
 #   OPRD_REPO_URL   OPRD git url                 (default: github ShenzhiYang2000/OPRD)
 #   BASE_COMMIT     base commit to pin           (default: contents of ./BASE_COMMIT)
 #   CONDA_ENV       conda env name               (default: verl)
@@ -34,7 +34,7 @@ DELIVERY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 OPRD_REPO_URL="${OPRD_REPO_URL:-https://github.com/ShenzhiYang2000/OPRD.git}"
 BASE_COMMIT="${BASE_COMMIT:-$(cat "$DELIVERY_DIR/BASE_COMMIT" 2>/dev/null || echo 93816fd)}"
-TARGET_DIR="${TARGET_DIR:-$HOME/OPRD_gad}"
+TARGET_DIR="${TARGET_DIR:-$DELIVERY_DIR/.oprd}"
 CONDA_ENV="${CONDA_ENV:-verl}"
 PATCH_MODE="${PATCH_MODE:-overlay}"
 RUN_SCRIPT="${RUN_SCRIPT:-smoke_debug.sh}"
@@ -86,7 +86,7 @@ stage_patch() {
         cp -r "$DELIVERY_DIR/modified_files_full/." "$TARGET_DIR/"
     fi
     log "copying launcher scripts into the repo root"
-    cp "$DELIVERY_DIR"/scripts/*.sh "$TARGET_DIR/"
+    cp "$DELIVERY_DIR"/scripts/* "$TARGET_DIR/"
     log "verification — git diff --stat (expect $EXPECTED_CHANGED_FILES files, +260/-29):"
     git -C "$TARGET_DIR" --no-pager diff --stat
     local n; n=$(git -C "$TARGET_DIR" diff --name-only | wc -l | tr -d ' ')
@@ -113,6 +113,8 @@ stage_env() {
     pip install math-verify
     log "editable install of verl (so 'python -m verl.trainer.main_ppo' resolves)"
     ( cd "$TARGET_DIR/verl" && pip install -e . --no-deps )
+    log "pin scipy==1.15.3 (the vllm stack pulls scipy 1.18 which needs numpy>=2 and crashes transformers import with numpy 1.26 via np.long) + matplotlib (needed when is_plot=True)"
+    pip install scipy==1.15.3 matplotlib
     log "env ready. NOTE: nvidia-smi 'CUDA 12.4' is the driver max; torch 2.8 runs on it via CUDA 12.x minor-version compatibility."
 }
 

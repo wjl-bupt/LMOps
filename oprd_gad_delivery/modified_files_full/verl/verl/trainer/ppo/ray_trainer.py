@@ -1396,6 +1396,20 @@ class RayPPOTrainer:
                                     # per-sequence score D(y_student) (nonzero only at the last
                                     # response token) IS the reward. Overrides any reward_fn.
                                     reward_tensor = batch.batch["values"]
+                                    # Trick 1 (GAN/GAIL): optional bounded reward shaping. Raw D(y) is
+                                    # unbounded and explodes when the discriminator saturates, destabilizing
+                                    # PG. GAIL-style log-sigmoid squashes it to (-inf, 0]. Only the last real
+                                    # response token is nonzero, so transform in place and keep zeros as zeros.
+                                    gad_reward_shaping = self.config.actor_rollout_ref.actor.get(
+                                        "gad_reward_shaping", "raw"
+                                    )
+                                    if gad_reward_shaping == "gail":
+                                        active = reward_tensor != 0
+                                        reward_tensor = torch.where(
+                                            active,
+                                            torch.nn.functional.logsigmoid(reward_tensor),
+                                            reward_tensor,
+                                        )
                                     reward_extra_infos_dict = {}
 
                         with marked_timer("adv", timing_raw, color="brown"):
@@ -2311,10 +2325,31 @@ class RayPPOTrainer:
 
                     # update critic
                     if self.use_critic and not rep_distillation_only:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                        # Trick 2 (GAN/GAIL): adaptive discriminator gating (TTUR-style) with a failsafe.
+                        # When the discriminator is too strong (last d_acc > hi) skip its update so the
+                        # generator can catch up — but never skip more than gad_d_max_skip times in a row,
+                        # so the discriminator can't be starved / go stale. Off by default (behavior
+                        # unchanged); the generator (actor) is never gated here, only the discriminator.
+                        do_update_critic = True
+                        if use_gad_discriminator and self.config.actor_rollout_ref.actor.get("gad_d_gate", False):
+                            d_acc_hi = float(self.config.actor_rollout_ref.actor.get("gad_d_acc_hi", 0.8))
+                            d_max_skip = int(self.config.actor_rollout_ref.actor.get("gad_d_max_skip", 5))
+                            last_d_acc = getattr(self, "_gad_last_d_acc", None)
+                            skip_count = getattr(self, "_gad_d_skip_count", 0)
+                            if last_d_acc is not None and last_d_acc > d_acc_hi and skip_count < d_max_skip:
+                                do_update_critic = False  # discriminator too strong -> let generator catch up
+                                self._gad_d_skip_count = skip_count + 1
+                            else:
+                                self._gad_d_skip_count = 0  # d_acc recovered, or failsafe -> force update
+                            metrics["gad/d_update_skipped"] = 0.0 if do_update_critic else 1.0
+                            metrics["gad/d_skip_count"] = float(self._gad_d_skip_count)
+                        if do_update_critic:
+                            with marked_timer("update_critic", timing_raw, color="pink"):
+                                critic_output = self.critic_wg.update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
+                            if "critic/d_acc" in critic_output_metrics:
+                                self._gad_last_d_acc = critic_output_metrics["critic/d_acc"]
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:

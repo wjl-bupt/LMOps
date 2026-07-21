@@ -170,6 +170,11 @@ class ActorConfig(BaseConfig):
     use_gad_discriminator: bool = False
     gad_coef: float = 1.0
     gad_gate_pg: bool = True
+    # GAN/GAIL stabilization tricks (default off -> behavior unchanged):
+    gad_reward_shaping: str = "raw"   # "raw" | "gail" (bounded log-sigmoid reward)
+    gad_d_gate: bool = False          # adaptive discriminator update gating
+    gad_d_acc_hi: float = 0.6         # skip discriminator update when last d_acc > this
+    gad_d_max_skip: int = 5           # failsafe: never skip discriminator more than N steps in a row
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
     data_loader_seed = 1

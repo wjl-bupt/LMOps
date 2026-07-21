@@ -19,10 +19,47 @@ L_actor =  rep_distillation_coef * MSE(h_student, sg(h_teacher))     # OPRD — 
 - **Positioning:** this is a *white-box* method (needs teacher hidden states); it is **not** compared
   against black-box GAD. GAD contributes only its adversarial-reward mechanism.
 
+## Updates (2026-07): pipeline hardening + GAN/GAIL tricks + deployment
+
+Changes made after getting the pipeline running end-to-end on 8× H20 (Qwen3-32B teacher → Qwen3-4B student). All new behavior is **opt-in / default-preserving** unless noted; OPD / OPRD baselines stay isolated.
+
+**Environment fix (folded into `bootstrap`).** The vLLM stack pulls **scipy 1.18** (needs numpy≥2), which crashes `import transformers` under the pinned numpy 1.26 via `np.long`. The env stage now runs `pip install scipy==1.15.3 matplotlib` (matplotlib is needed when `is_plot=True`).
+
+**GAN/GAIL stabilization tricks (opt-in, default OFF)** — added to fight discriminator saturation / divergence (an un-tricked 32B→4B run had `d_acc→1.0`, KL blow-up, student AIME24 acc collapsing 0.16→0):
+| env | default | effect |
+|---|---|---|
+| `GAD_REWARD_SHAPING` | `raw` | `gail` = bounded `logσ(D)` reward (raw `D` is unbounded, explodes when D saturates) |
+| `GAD_D_GATE` | `False` | adaptive discriminator gating: skip the D update when last `d_acc > GAD_D_ACC_HI` |
+| `GAD_D_ACC_HI` | `0.6` | gate threshold |
+| `GAD_D_MAX_SKIP` | `5` | **failsafe**: never skip D more than N steps in a row (so D can't be starved) |
+
+New metrics: `gad/d_update_skipped`, `gad/d_skip_count`. All gated behind `use_gad_discriminator`. Code: reward shaping + gating in `ray_trainer.py`; fields declared in `workers/config/actor.py`.
+
+**`teacher_response` no longer crashes on length.** `rl_dataset.py` now tokenizes `teacher_response` with `truncation="right"` (was the global `truncation='error'` → crashed when a teacher solution exceeded `max_response_length`). Over-long teacher references are truncated, not fatal. *(Supersedes the old "over-long teacher_response will crash" gotcha below.)*
+
+**`gad_oprd_distillation.sh` self-contains step 0.** It auto-builds the `teacher_response` parquet if missing (`GAD_TRAIN_DATASET`), injects student/teacher/discriminator model paths via Hydra, and defaults `MODEL_DTYPE=bfloat16`. Env knobs: `TEACHER_MODEL_PATH` (default Qwen3-32B), `STUDENT_MODEL_PATH` (default Qwen3-4B), `GAD_BASE_DATASET`, `TEACHER_GEN_N`, `TEACHER_GEN_TP`, `FORCE_REBUILD_TEACHER`.
+
+**`build_teacher_response_parquet.py`** gained `--tp N` (tensor-parallel for large teachers, e.g. 32B) and `--sample [--seed]` (random-sample N rows — DAPO is **ordered by answer magnitude**, so the first-N is biased).
+
+**More env-configurable knobs** (`on_policy_distillation.sh`): `KL_LOSS_COEF`/`KL_LOSS_TYPE` (default 0.005 / low_var_kl); `VAL_N` (val n, default **4**, was 16); `MAX_VAL_RESP_LENGTH` (default **8192**, was 15360); `TEST_FREQ` (default **50**, was 2). OPRD-only: `REP_DISTILLATION_LAST_K`/`REP_DISTILLATION_LAYERS` now overridable.
+
+**Data paths are now absolute (`DATA_ROOT`).** `TRAIN_DATASET`, `TEST_DATA_DIR`, `GAD_BASE_DATASET` derive from `DATA_ROOT` (default `/dockerdata/junewluo/datasets`) instead of the CWD-relative `../datasets` — so runs work regardless of where the repo is checked out. Override with `export DATA_ROOT=/that/box/datasets`.
+
+**Reward-function path fixed** in `on_policy_distillation.sh`: `verl/utils/...` → `verl/verl/utils/...` (nested layout). No longer needs a command-line override.
+
+**Deployment = self-contained checkout.** `bootstrap` `TARGET_DIR` default is now `<delivery>/.oprd` (was `$HOME/OPRD_gad`); the overlay step now `cp scripts/*` (was `*.sh`) so the `.py` helpers land in the repo root too. Notes: set `PROJECT_PATH` to keep the 100s-of-GB training outputs **out** of `.oprd`; don't ship a pre-cloned `.oprd` (bootstrap re-creates it per machine); gitignore `.oprd/` if the delivery is tracked.
+
+**New helper scripts** (`scripts/`): `dedup_train_parquet.py` (DAPO ships ~100× duplicated — 1,791,700 rows / 17,398 unique prompts; dedup before training) and `analyze_train_log.py` (`python3 analyze_train_log.py logs/run_*.log` → eval curve + training-metric trend + gate activity).
+
+**Memory profile (32B teacher → 4B student, 8× H20).** Full rep-MSE over all layers + `last_k=2000` OOMs; use `REP_DISTILLATION_LAYERS=last`, `REP_DISTILLATION_LAST_K=256`, `TEACHER_PARAM_OFFLOAD=False`, `MODEL_DTYPE=bfloat16`, `data.dataloader_num_workers=1`. `MINI_BATCH_SIZE=64` OOM'd at step 19 (fragmentation at the ~93/95 GB edge); `32` is safer, and `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` mitigates fragmentation. Note these are **shared** GPUs — check `nvidia-smi` for other tenants before launching.
+
+---
+
 ## Contents
 
 | Path | What |
 |---|---|
+| `DEPLOY.md` | **New-machine deployment runbook** — env → models → data → smoke → experiments. |
 | `bootstrap_oprd_gad.sh` | **One-command** setup+run: clone OPRD@base → apply merge → build conda env → self-check → run. |
 | `BASE_COMMIT` | The OPRD base commit the merge is pinned to (read by the bootstrap script). |
 | `oprd_gad.patch` | All source changes, as a `git apply`-able patch against the OPRD fork (base commit `93816fd`). |
@@ -53,7 +90,7 @@ RUN_SCRIPT=smoke_debug.sh bash bootstrap_oprd_gad.sh run
 It clones OPRD pinned to `BASE_COMMIT`, **overlays** the merge (file-copy — CRLF/patch-context proof),
 copies the launchers, builds the `verl` conda env, and runs the checks. Idempotent and stage-selectable:
 `bash bootstrap_oprd_gad.sh clone patch | env | check | run | all`. Override via env:
-`TARGET_DIR` (default `$HOME/OPRD_gad`), `CONDA_ENV` (`verl`), `PATCH_MODE` (`overlay`|`apply`),
+`TARGET_DIR` (default `<delivery>/.oprd`), `CONDA_ENV` (`verl`), `PATCH_MODE` (`overlay`|`apply`),
 `RUN_SCRIPT`, `RUN_ARGS`, `OPRD_REPO_URL`.
 
 The manual steps below do the same thing by hand.
@@ -75,9 +112,6 @@ USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh # vllm0.11 / torch2.8 /
 pip install math-verify
 pip install -e . --no-deps                               # make `verl` importable for `python -m verl.trainer.main_ppo`
 cd ..
-
-# if run bash go to wrong, you can try this. if the raise error is cause by environment .
-# pip install scipy==1.15.3、pip install matplotlib
 
 # 3. Model & data paths
 export MODEL_DIR=/path/to/models
@@ -162,31 +196,6 @@ bash gad_oprd_distillation.sh
 bash baseline_oprd_only.sh
 bash baseline_opd.sh
 ```
-
-### Configuration & env overrides
-
-**Every setting is env-overridable with sensible defaults** — no need to edit the scripts:
-```bash
-MODEL_DIR=/models ACTOR_MODEL_PATH=/models/Qwen3-1.7B-Base REWARD_MODEL_PATH=/models/Qwen3-4B \
-TRAIN_DATASET=../datasets/dapo-math-17k-gad.parquet \
-TEST_FILE='["../datasets/test_data/AIME24/test.parquet"]' \
-N_GPUS_PER_NODE=8 GAD_COEF=0.5 REP_LOW_RANK=8 MAX_RESP_LENGTH=8192 \
-bash gad_oprd_distillation.sh
-```
-Common knobs: **models** `MODEL_DIR / ACTOR_MODEL_PATH / REWARD_MODEL_PATH / DISCRIMINATOR_MODEL_PATH`;
-**data** `TRAIN_DATASET / TEST_FILE / TEST_DATA_DIR`; **resources** `N_GPUS_PER_NODE / PARALLEL_SIZE (tp) /
-GPU_MEMORY_UTILIZATION / MINI_BATCH_SIZE / N_RESPONSES / MAX_RESP_LENGTH / MAX_PROMPT_LENGTH`; **OPRD**
-`REP_DISTILLATION_COEF / REP_DISTILLATION_LAYERS / REP_DISTILLATION_POSITIONS / REP_DISTILLATION_LAST_K /
-REP_LOW_RANK / REP_PROJECTOR_MODE / REP_FREEZE_PS`; **GAD** `GAD_COEF / GAD_GATE_PG / CRITIC_LR / CRITIC_MICRO_BSZ`;
-**quick test** `TOTAL_TRAINING_STEPS / TEST_FREQ / SAVE_FREQ`.
-
-Each launcher fixes only its **identity switches** (`USE_GAD_DISCRIMINATOR`, `USE_REP_DISTILLATION`,
-`REP_DISTILLATION_ONLY`, `ADV_ESTIMATOR`) — to switch method, pick a different launcher, not an env var.
-Because everything else is env-driven, **unset stale vars (or use a fresh shell) when switching methods**.
-
-> Fixed in this delivery: `on_policy_distillation.sh` previously **hard-set** `ADV_ESTIMATOR`, model paths,
-> `TRAIN_DATASET`, etc., which silently clobbered wrapper/env values (e.g. the combined run would have
-> reverted to `token_reward_direct` instead of `grpo`). These are now `${VAR:-default}`.
 
 ## Debugging
 

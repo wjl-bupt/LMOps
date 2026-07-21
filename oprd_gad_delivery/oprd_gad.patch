@@ -1,31 +1,614 @@
+diff --git a/RUN_NOTES_baseline_opd.md b/RUN_NOTES_baseline_opd.md
+new file mode 100644
+index 0000000..0155f59
+--- /dev/null
++++ b/RUN_NOTES_baseline_opd.md
+@@ -0,0 +1,112 @@
++# baseline_opd.sh 跑通复盘
++
++> 环境：conda `oprd_gad`（Python 3.12 / torch 2.8+cu128 / vllm 0.11 / ray 2.56 / transformers 4.56.1），8× H20，仓库根目录 `/dockerdata/junewluo/OPRD`。
++> 日期：2026-07-14。
++
++`baseline_opd.sh` 只是设置一批环境变量后 `exec` 到 `on_policy_distillation.sh`（纯 OPD：output-space top-k reverse-KL 蒸馏，GAD 关闭）。首次运行时依次踩了 3 个坑，另有 1 个非致命项和 1 个数据集问题。
++
++---
++
++## 1. scipy / numpy 版本冲突（真正的硬阻塞）
++
++**现象**：`import verl.trainer.main_ppo` 直接失败，根因栈是
++```
++transformers/loss/loss_for_object_detection.py -> from scipy.optimize import linear_sum_assignment
++  -> scipy/sparse/_sputils.py: np.long
++  -> AttributeError: module 'numpy' has no attribute 'long'
++```
++**原因**：环境里装了 **scipy 1.18.0（要求 numpy ≥ 2.0）**，但 numpy 是 **1.26.4**（本环境的刻意锁定版本，很多编译扩展依赖 numpy 1.x 的 ABI）。scipy 1.18 用到了 numpy 2.x 才有、numpy 1.x 已删除的 `np.long`。transformers 在 import 阶段就会拉起这条 object-detection loss 的导入链，于是整包 import 崩溃，main_ppo 根本加载不了。
++
++**修复**（不动 numpy，只降 scipy 到兼容 numpy 1.26.4 的版本）：
++```bash
++pip install scipy==1.15.3
++```
++> 不要升级 numpy 到 2.x —— 那样风险更大（torch/vllm 等编译扩展的 ABI）。
++
++---
++
++## 2. custom reward function 路径错误
++
++**现象**：脚本里写死
++```
++custom_reward_function.path="verl/utils/reward_score/ttrl_math/__init__.py"
++```
++但从仓库根目录看，真实路径是嵌套目录 `verl/verl/utils/reward_score/ttrl_math/__init__.py`（仓库是 `OPRD/verl/verl/...` 的双层结构）。写死路径少了一层 `verl/`。
++
++**修复**：命令行覆盖（Hydra 取最后一个同名 key 的值，`"$@"` 在脚本末尾追加，所以会生效）：
++```
++custom_reward_function.path=/dockerdata/junewluo/OPRD/verl/verl/utils/reward_score/ttrl_math/__init__.py
++```
++> 更彻底的做法是直接改 `on_policy_distillation.sh` 第 324 行。
++
++---
++
++## 3. 验证集缺失（默认 AMC23 不存在）
++
++**现象**：脚本默认
++```
++TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AMC23/test.parquet"]}
++```
++但 `../datasets/test_data/` 下只有 `AIME24`，没有 `AMC23`。
++
++**修复**：用环境变量覆盖 `TEST_FILE` 指向已存在的 AIME24：
++```bash
++export TEST_FILE='["/dockerdata/junewluo/datasets/test_data/AIME24/test.parquet"]'
++```
++> 或用 `download_data.sh` 把 AMC23 等其它评测集放到 `$DATA_ROOT/test_data/<BENCH>/test.parquet`。
++
++---
++
++## 4. matplotlib 缺失（非致命）
++
++**现象**：`IS_PLOT=True` 时，`ray_trainer.py` 里 `import matplotlib.pyplot as plt` 报 `No module named 'matplotlib'`，日志出现 `Error plotting/logging: ...` + 一段 traceback。但它被 try/except 捕获，**不影响训练**（step 1 照常完成、继续 step 2）。
++
++**修复**：
++```bash
++pip install matplotlib
++```
++
++---
++
++## 5. 数据集"17k"其实有 179 万行 —— 已去重
++
++**现象**：预处理阶段 `Filtering prompts longer than 2048 tokens` 要过滤 **1,791,700** 条，`Total training steps: 223962`（= 1791700 / batch 8），看起来完全不合理。
++
++**原因**：我们**确实只用一个数学集合 DAPO-Math-17k**。名字里的 **17k 指"唯一题目数"，不是行数**。BytedTsinghua-SIA 官方发布的这个 parquet 把**每道题重复了约 100 次**（RL 采样设定的遗留）：
++- 总行数 **1,791,700**
++- 唯一 prompt **17,398**
++- 平均重复 ~103 次（个别达 400 次）
++
++verl 的 `data.filter_overlong_prompts=True` 会扫描**每一行**（不识别重复），且 `shuffle=False` + `train_batch_size=8` 让它把 179 万行全当独立样本 → 于是 22 万步、10 分钟预处理都是被重复行撑大的。
++
++**修复**：用 `dedup_train_parquet.py` 按 prompt 去重（保留每题首条，Arrow schema 原样保留，非破坏性写新文件）：
++```bash
++python3 dedup_train_parquet.py \
++  --in  ../datasets/dapo-math-17k.parquet \
++  --out ../datasets/dapo-math-17k-dedup.parquet
++# rows: 1791700 -> 17398 (removed 99.0% duplicates)
++```
++去重后：过滤快约 100 倍，步数降到 **17398 / 8 ≈ 2175** 步/epoch。用它训练：命令行加
++```
++data.train_files=../datasets/dapo-math-17k-dedup.parquet
++```
++
++---
++
++## 最终可用启动命令（从仓库根目录）
++
++```bash
++cd /dockerdata/junewluo/OPRD
++conda activate oprd_gad
++export TEST_FILE='["/dockerdata/junewluo/datasets/test_data/AIME24/test.parquet"]'
++bash baseline_opd.sh \
++  data.train_files=../datasets/dapo-math-17k-dedup.parquet \
++  custom_reward_function.path=/dockerdata/junewluo/OPRD/verl/verl/utils/reward_score/ttrl_math/__init__.py
++```
++
++**验证结果**：step 1 完整跑通（`actor/pg_loss`、`grad_norm`、reward model 打分、OPD top-k 指标齐全，~142s/step），step 2 触发首次验证（`test_freq=2`）。
++
++## 一次性环境修复汇总
++```bash
++pip install scipy==1.15.3 matplotlib
++```
+diff --git a/analyze_train_log.py b/analyze_train_log.py
+new file mode 100644
+index 0000000..2fcdbfb
+--- /dev/null
++++ b/analyze_train_log.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++analyze_train_log.py — extract training-progress changes from an OPRD/GAD run log.
++
++Prints three things, parsed from the tee'd stdout log (logs/run_*.log):
++  1. Eval curve  — AIME24 acc (best@k / maj@k) at each validation point (baseline + every test_freq).
++  2. Training trend — sampled steps: pg_loss / rep_loss / kl_loss / grad_norm / d_loss / d_acc / resp_len / clip%.
++  3. Trick activity — GAN/GAIL discriminator-gating (gad/d_skip_count, gad/d_update_skipped) if present.
++
++Usage:
++    python3 analyze_train_log.py logs/run_20260717_153153.log
++"""
++import re
++import sys
++
++LOG = sys.argv[1] if len(sys.argv) > 1 else "logs/run_20260717_153153.log"
++txt = open(LOG, encoding="utf-8", errors="ignore").read()
++
++
++def num(line, key):
++    m = re.search(re.escape(key) + r":(-?[0-9.eE+\-]+)", line)
++    if not m:
++        return None
++    try:
++        return float(m.group(1))
++    except ValueError:
++        return None
++
++
++def fmt(v, f):
++    return "NA" if v is None else format(v, f)
++
++
++# ---- 1. eval curve (validation accuracy) ----
++best = [float(x) for x in re.findall(r"val-core/[a-z_]+/acc/best@\d+/mean:([0-9.]+)", txt)]
++maj = [float(x) for x in re.findall(r"val-core/[a-z_]+/acc/maj@\d+/mean:([0-9.]+)", txt)]
++print(f"# log: {LOG}\n")
++print("## 1) 评估曲线 (AIME24 acc)")
++if best:
++    print("| # | 验证点 | best@k | maj@k | Δbest vs baseline |")
++    print("|---|---|---|---|---|")
++    b0 = best[0]
++    for i, bb in enumerate(best):
++        lab = "baseline" if i == 0 else f"val#{i}"
++        mm = f"{maj[i]:.4f}" if i < len(maj) else ""
++        print(f"| {i} | {lab} | {bb:.4f} | {mm} | {bb-b0:+.4f} |")
++else:
++    print("(还没有验证点)")
++
++# ---- 2. training trend (per-step metrics) ----
++KEYS = ["training/global_step", "actor/pg_loss", "actor/rep_loss", "actor/kl_loss",
++        "actor/grad_norm", "critic/d_loss", "critic/d_acc", "response_length/mean",
++        "response_length/clip_ratio", "gad/d_skip_count"]
++rows = {}
++for line in txt.splitlines():
++    if "training/global_step:" in line and "step:" in line:
++        d = {k: num(line, k) for k in KEYS}
++        if d["training/global_step"] is not None:
++            rows[int(d["training/global_step"])] = d
++steps = [rows[k] for k in sorted(rows)]
++print("\n## 2) 训练趋势 (采样步)")
++if steps:
++    print("| step | pg_loss | rep_loss | kl_loss | grad_norm | d_loss | d_acc | resp_len | clip% |")
++    print("|---|---|---|---|---|---|---|---|---|")
++    allsteps = sorted(rows)
++    # sample ~12 evenly-spaced steps + always the last
++    pick = sorted(set(allsteps[:: max(1, len(allsteps) // 12)] + [allsteps[-1]]))
++    for st in pick:
++        r = rows[st]
++        print(f"| {st} | {fmt(r['actor/pg_loss'],'+.4f')} | {fmt(r['actor/rep_loss'],'.4f')} | "
++              f"{fmt(r['actor/kl_loss'],'.4f')} | {fmt(r['actor/grad_norm'],'.2f')} | "
++              f"{fmt(r['critic/d_loss'],'.4g')} | {fmt(r['critic/d_acc'],'.3f')} | "
++              f"{fmt(r['response_length/mean'],'.0f')} | {fmt((r['response_length/clip_ratio'] or 0)*100,'.0f')} |")
++    print(f"\n(已解析 {len(steps)} 个训练步)")
++else:
++    print("(还没有训练步)")
++
++# ---- 3. discriminator-gating trick activity ----
++skips = [r["gad/d_skip_count"] for r in steps if r.get("gad/d_skip_count") is not None]
++print("\n## 3) 判别器门控 (Trick②) 活跃度")
++if skips:
++    fired = sum(1 for s in skips if s and s > 0)
++    print(f"记录步数={len(skips)} | 触发跳过的步数={fired} | 最大连续跳过={max(skips):.0f}")
++else:
++    print("(未记录 gad/d_skip_count —— 门控未开或该版本未跑到)")
+diff --git a/baseline_opd.sh b/baseline_opd.sh
+new file mode 100755
+index 0000000..92badab
+--- /dev/null
++++ b/baseline_opd.sh
+@@ -0,0 +1,27 @@
++#!/bin/bash
++# ==============================================================================
++# Baseline: OPD (output-space top-k reverse-KL distillation), optionally + OPRD.
++# This is the native OPRD-fork OPD path, UNCHANGED by the GAD merge. GAD is OFF.
++# ==============================================================================
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++export MODEL_DIR=${MODEL_DIR:-/dockerdata/junewluo/models}
++export ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-${MODEL_DIR}/Qwen3-1.7B-Base}
++export REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-${MODEL_DIR}/Qwen3-4B}
++
++# OPD: top-k reverse KL on output distributions. Set REP off for pure OPD, or leave
++# rep on for OPD+OPRD (the paper's L = L_OPD + mu*L_OPRD).
++export USE_REP_DISTILLATION=${USE_REP_DISTILLATION:-False}
++export REP_DISTILLATION_ONLY=False
++export LOG_PROB_TOP_K=${LOG_PROB_TOP_K:-16}     # top-k for OPD reverse-KL
++export TOP_K_STRATEGY=${TOP_K_STRATEGY:-only_stu}
++export REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-student_p}
++
++export USE_GAD_DISCRIMINATOR=False              # <-- no discriminator
++export ADV_ESTIMATOR=${ADV_ESTIMATOR:-token_reward_direct}
++
++export PROJECT_NAME=${PROJECT_NAME:-OPD_baseline}
++export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k-opd}
++
++exec bash "$SCRIPT_DIR/on_policy_distillation.sh" "$@"
+diff --git a/baseline_oprd_only.sh b/baseline_oprd_only.sh
+new file mode 100755
+index 0000000..f278f23
+--- /dev/null
++++ b/baseline_oprd_only.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++# ==============================================================================
++# Baseline: OPRD-only (representation MSE, no adversarial reward, no OPD reverse-KL)
++# Reproduces the paper's OPRD-Vanilla / OPRD-Bridge distillation. GAD is OFF -> the
++# critic/discriminator is never instantiated. This is the primary comparison baseline.
++# ==============================================================================
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++export MODEL_DIR=${MODEL_DIR:-/dockerdata/junewluo/models}
++export ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-${MODEL_DIR}/Qwen3-1.7B-Base}
++export REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-${MODEL_DIR}/Qwen3-4B}
++
++export USE_REP_DISTILLATION=True
++export REP_DISTILLATION_ONLY=True           # rep MSE only (skips the PG block entirely)
++export REP_DISTILLATION_COEF=${REP_DISTILLATION_COEF:-1.0}
++export REP_DISTILLATION_POSITIONS=last_k
++export REP_DISTILLATION_LAST_K=${REP_DISTILLATION_LAST_K:-2000}
++export REP_DISTILLATION_LAYERS=${REP_DISTILLATION_LAYERS:-all}
++export REP_PROJECTOR_MODE=low_rank
++export REP_LOW_RANK=${REP_LOW_RANK:-8}
++export REP_FREEZE_PS=False
++
++export USE_GAD_DISCRIMINATOR=False          # <-- no discriminator
++export LOG_PROB_TOP_K=0
++export ADV_ESTIMATOR=${ADV_ESTIMATOR:-grpo}
++
++export PROJECT_NAME=${PROJECT_NAME:-OPRD_only_baseline}
++export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k-oprd-only}
++
++exec bash "$SCRIPT_DIR/on_policy_distillation.sh" "$@"
+diff --git a/build_teacher_response_parquet.py b/build_teacher_response_parquet.py
+new file mode 100644
+index 0000000..6984c1e
+--- /dev/null
++++ b/build_teacher_response_parquet.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++build_teacher_response_parquet.py — add the GAD discriminator's `teacher_response`
++text column to a verl-format math parquet.
++
++GAD trains the critic as a Bradley-Terry discriminator (teacher solution > student
++solution). It needs, per prompt, the TEACHER's own solution text as the "real" example.
++This script generates that with the teacher model (Qwen3-4B) via vLLM and appends it as
++a `teacher_response` string column, preserving the original Arrow schema of every other
++column.
++
++Usage:
++    python3 build_teacher_response_parquet.py \
++        --in ../datasets/dapo-math-17k-dedup.parquet \
++        --out ../datasets/dapo-math-17k-gad-mini.parquet \
++        --teacher /dockerdata/junewluo/models/Qwen3-4B \
++        --n 64 --max-tokens 2048
++"""
++import argparse
++import numpy as np
++import pyarrow as pa
++import pyarrow.parquet as pq
++from transformers import AutoTokenizer
++from vllm import LLM, SamplingParams
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--in", dest="inp", required=True)
++    ap.add_argument("--out", dest="out", required=True)
++    ap.add_argument("--teacher", required=True)
++    ap.add_argument("--n", type=int, default=64, help="number of prompts to keep/generate (0 = all)")
++    ap.add_argument("--max-tokens", type=int, default=2048)
++    ap.add_argument("--temperature", type=float, default=0.7)
++    ap.add_argument("--gpu-mem", type=float, default=0.85)
++    ap.add_argument("--tp", type=int, default=1,
++                    help="tensor_parallel_size for the teacher (use >1 for large teachers like 32B)")
++    ap.add_argument("--sample", action="store_true",
++                    help="randomly sample --n rows (seeded, reproducible) instead of taking the first --n. "
++                         "Use this to avoid ordering bias in the source parquet (DAPO is ordered by answer magnitude).")
++    ap.add_argument("--seed", type=int, default=42, help="random seed used when --sample is set")
++    args = ap.parse_args()
++
++    table = pq.read_table(args.inp)
++    if args.n and args.n > 0 and args.n < table.num_rows:
++        if args.sample:
++            idx = np.sort(
++                np.random.default_rng(args.seed).choice(table.num_rows, size=args.n, replace=False)
++            )
++            table = table.take(pa.array(idx))
++            print(f"[teacher] random-sampled {args.n} rows (seed={args.seed}) from {args.inp}")
++        else:
++            table = table.slice(0, args.n)
++            print(f"[teacher] took first {args.n} rows from {args.inp}")
++    n = table.num_rows
++
++    # Build teacher prompts by applying the chat template (thinking OFF, to match training).
++    prompt_lists = table.column("prompt").to_pylist()  # each: [{"role","content"}, ...]
++    tok = AutoTokenizer.from_pretrained(args.teacher)
++    prompts = [
++        tok.apply_chat_template(
++            [{"role": m["role"], "content": m["content"]} for m in p],
++            tokenize=False, add_generation_prompt=True, enable_thinking=False,
++        )
++        for p in prompt_lists
++    ]
++
++    llm = LLM(model=args.teacher, dtype="bfloat16",
++              tensor_parallel_size=args.tp,
++              gpu_memory_utilization=args.gpu_mem,
++              max_model_len=args.max_tokens + 2048)
++    sp = SamplingParams(temperature=args.temperature, top_p=0.95, max_tokens=args.max_tokens)
++    outs = llm.generate(prompts, sp)
++    responses = [o.outputs[0].text for o in outs]
++
++    table = table.append_column("teacher_response", pa.array(responses, type=pa.string()))
++    pq.write_table(table, args.out)
++
++    lens = [len(r) for r in responses]
++    print(f"[teacher] wrote {args.out}: {n} rows, teacher_response added.")
++    print(f"[teacher] response char-length min/mean/max: "
++          f"{min(lens)}/{sum(lens)//len(lens)}/{max(lens)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/dedup_train_parquet.py b/dedup_train_parquet.py
+new file mode 100644
+index 0000000..a50b146
+--- /dev/null
++++ b/dedup_train_parquet.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""
++dedup_train_parquet.py — collapse the DAPO-Math-17k parquet to one row per unique prompt.
++
++The published BytedTsinghua-SIA/DAPO-Math-17k parquet repeats each of the ~17k unique
++problems ~100x (1,791,700 rows total). verl's data.filter_overlong_prompts=True scans
++*every* row, and with shuffle=False + train_batch_size=B it treats all rows as distinct
++samples -> total_training_steps = num_rows / B (~224k steps for the bloated file).
++
++This dedup keeps the FIRST occurrence of each unique prompt, preserving the exact Arrow
++schema (nested prompt/reward_model/extra_info structs are untouched). Non-destructive:
++writes a new file, never modifies the input.
++
++Usage:
++    python3 dedup_train_parquet.py \
++        --in  ../datasets/dapo-math-17k.parquet \
++        --out ../datasets/dapo-math-17k-dedup.parquet
++"""
++import argparse
++import pandas as pd
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--in", dest="inp", required=True, help="input parquet")
++    ap.add_argument("--out", dest="out", required=True, help="output parquet")
++    ap.add_argument("--key", default="prompt",
++                    help="column to dedup on (default: prompt)")
++    args = ap.parse_args()
++
++    table = pq.read_table(args.inp)
++    n_before = table.num_rows
++
++    # Build a hashable dedup key by stringifying the (possibly nested) key column.
++    key_series = pd.read_parquet(args.inp, columns=[args.key])[args.key].astype(str)
++    keep_mask = ~key_series.duplicated(keep="first")  # True where this is the first time we see the prompt
++
++    # Slice the ORIGINAL Arrow table with the mask -> schema/types preserved exactly.
++    table_dedup = table.filter(pa.array(keep_mask.to_numpy()))
++    n_after = table_dedup.num_rows
++
++    pq.write_table(table_dedup, args.out)
++
++    print(f"[dedup] input : {args.inp}")
++    print(f"[dedup] output: {args.out}")
++    print(f"[dedup] rows  : {n_before} -> {n_after}  (removed {n_before - n_after}, "
++          f"{100 * (n_before - n_after) / n_before:.1f}% duplicates)")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/download_data.sh b/download_data.sh
+new file mode 100755
+index 0000000..6fca421
+--- /dev/null
++++ b/download_data.sh
+@@ -0,0 +1,63 @@
++#!/bin/bash
++# ==============================================================================
++# download_data.sh — fetch the verl-format datasets for OPRD+GAD.
++#   train : DAPO-Math-17k     (HuggingFace, already verl-format)
++#   eval  : AIME24            (HuggingFace, already verl-format)
++# Both parquets are ready to use (columns: prompt / data_source / reward_model.ground_truth /
++# ability / extra_info) — NO preprocessing needed. AIME24 is a *validation* set, not training data.
++#
++# Idempotent: skips files that already exist (OVERWRITE=1 to refetch).
++# Paths match what the launchers expect:
++#   on_policy_distillation.sh -> TRAIN_DATASET=../datasets/dapo-math-17k.parquet
++#                                TEST_DATA_DIR=../datasets/test_data
++# Run this from the OPRD repo root so `../datasets` resolves there, or set DATA_ROOT explicitly.
++# ==============================================================================
++set -euo pipefail
++
++DATA_ROOT="${DATA_ROOT:-../datasets}"
++OVERWRITE="${OVERWRITE:-0}"
++
++TRAIN_URL="https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k/resolve/main/data/dapo-math-17k.parquet?download=true"
++AIME24_URL="https://huggingface.co/datasets/BytedTsinghua-SIA/AIME-2024/resolve/main/data/aime-2024.parquet?download=true"
++
++TRAIN_OUT="$DATA_ROOT/dapo-math-17k.parquet"
++AIME24_OUT="$DATA_ROOT/test_data/AIME24/test.parquet"
++
++fetch() {  # <url> <out>
++    local url="$1" out="$2"
++    mkdir -p "$(dirname "$out")"
++    if [ -f "$out" ] && [ "$OVERWRITE" != "1" ]; then
++        echo "[download] exists, skip: $out   (OVERWRITE=1 to refetch)"
++        return
++    fi
++    echo "[download] -> $out"
++    if command -v wget >/dev/null 2>&1; then
++        wget -c -O "$out" "$url"
++    elif command -v curl >/dev/null 2>&1; then
++        curl -L -o "$out" "$url"
++    else
++        echo "ERROR: neither wget nor curl found" >&2; exit 1
++    fi
++}
++
++echo "[download] DATA_ROOT=$DATA_ROOT"
++fetch "$TRAIN_URL"  "$TRAIN_OUT"     # training  (DAPO-Math-17k)
++fetch "$AIME24_URL" "$AIME24_OUT"    # eval      (AIME24 -> $TEST_DATA_DIR/AIME24/test.parquet)
++
++cat <<EOF
++
++[download] done.
++  train : $TRAIN_OUT
++  eval  : $AIME24_OUT
++          use it via:  export TEST_FILE='["$DATA_ROOT/test_data/AIME24/test.parquet"]'
++
++Next, for GAD, add the discriminator's teacher_response column to the TRAIN parquet:
++  python3 scripts/build_teacher_response_parquet.py \\
++      --in  $TRAIN_OUT \\
++      --out ${TRAIN_OUT%.parquet}-gad.parquet \\
++      --teacher \$REWARD_MODEL_PATH
++  # then:  TRAIN_DATASET=${TRAIN_OUT%.parquet}-gad.parquet bash gad_oprd_distillation.sh
++
++Other eval sets (AIME25 / AMC23 / MATH-500 / ...) live on HuggingFace in the same verl format;
++put each at \$DATA_ROOT/test_data/<BENCH>/test.parquet and add it to TEST_FILE.
++EOF
+diff --git a/gad_oprd_distillation.sh b/gad_oprd_distillation.sh
+new file mode 100755
+index 0000000..5978c02
+--- /dev/null
++++ b/gad_oprd_distillation.sh
+@@ -0,0 +1,94 @@
++#!/bin/bash
++# ==============================================================================
++# OPRD + GAD combined run (representation MSE primary + adversarial reward auxiliary)
++# ==============================================================================
++# Objective:  L_actor = gad_coef * PG(D(y_student))  +  rep_distillation_coef * MSE(h_student, h_teacher)  +  KL
++#   - OPRD (teacher hidden-state MSE)   -> primary, deterministic, low-variance signal
++#   - GAD  (discriminator reward, GRPO) -> auxiliary, global adversarial signal
++#
++# White-box, cross-architecture (big teacher -> small student). Uses the LIGHTWEIGHT bridge:
++#   rep_projector_mode=low_rank + in-training PCA init of P_T + jointly-trained P_S
++#   (no offline 3-stage bridge construction). See README for the frozen-bridge upgrade.
++#
++# Data contract: the training parquet MUST contain a `teacher_response` TEXT column
++#   (the teacher's own solution to each prompt) — this is the discriminator's "real" example.
++#
++# Copy this file into the OPRD fork root (next to on_policy_distillation.sh) and run it.
++# ------------------------------------------------------------------------------
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++# ---- models (EDIT) ----
++export MODEL_DIR=${MODEL_DIR:-/dockerdata/junewluo/models}
++export STUDENT_MODEL_PATH=${STUDENT_MODEL_PATH:-${MODEL_DIR}/Qwen3-4B}                  # student (actor)
++export TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/dockerdata/junewluo/Qwen3-32B}         # white-box teacher (hidden states + teacher_response)
++export DISCRIMINATOR_MODEL_PATH=${DISCRIMINATOR_MODEL_PATH:-${STUDENT_MODEL_PATH}}      # discriminator backbone (small)
++export MODEL_DTYPE=${MODEL_DTYPE:-bfloat16}                                             # GAD loads 3 model roles -> bf16 by default to avoid OOM
++
++# ---- OPRD (primary) ----
++export USE_REP_DISTILLATION=True
++export REP_DISTILLATION_ONLY=False          # <-- False so the adversarial PG term is added
++export REP_DISTILLATION_COEF=${REP_DISTILLATION_COEF:-1.0}    # mu
++export REP_DISTILLATION_POSITIONS=last_k
++export REP_DISTILLATION_LAST_K=${REP_DISTILLATION_LAST_K:-2000}
++export REP_DISTILLATION_LAYERS=${REP_DISTILLATION_LAYERS:-all}
++export REP_PROJECTOR_MODE=low_rank          # cross-arch bridge
++export REP_LOW_RANK=${REP_LOW_RANK:-8}
++export REP_FREEZE_PS=False                  # joint P_S (lightweight bridge)
++# Optional frozen-bridge upgrade (stronger, per paper). Build ps_bank.pt offline first, then:
++# export REP_LOW_RANK_INIT_CHECKPOINT=${SCRIPT_DIR}/outputs/bridge_construction/rank_${REP_LOW_RANK}/ps_bank.pt
++# export REP_FREEZE_PS=True
++
++# ---- GAD (auxiliary) ----
++export USE_GAD_DISCRIMINATOR=True
++export GAD_COEF=${GAD_COEF:-0.5}            # lambda: START SMALL (0.1-1). Keep rep term dominant.
++export GAD_GATE_PG=True
++export CRITIC_LR=${CRITIC_LR:-1e-6}
++export CRITIC_MICRO_BSZ=${CRITIC_MICRO_BSZ:-1}
++
++# ---- no OPD top-k reverse-KL in the primary method (ablation only) ----
++export LOG_PROB_TOP_K=0
++export ADV_ESTIMATOR=${ADV_ESTIMATOR:-grpo}
++export USE_KL=${USE_KL:-True}
++
++export PROJECT_NAME=${PROJECT_NAME:-OPRD_GAD}
++export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k-oprd-gad}
++
++# ==============================================================================
++# Step 0 (auto): build the `teacher_response` column the GAD discriminator requires.
++# The pipeline does NOT generate teacher responses online — it only READS this column
++# from the training parquet (rl_dataset.py) and the discriminator (dp_critic.py) hard-
++# depends on it. So we generate it here with $TEACHER_MODEL_PATH if the file is absent.
++# ==============================================================================
++export GAD_BASE_DATASET=${GAD_BASE_DATASET:-${DATA_ROOT:-/dockerdata/junewluo/datasets}/dapo-math-17k-dedup.parquet}      # source parquet (no teacher_response)
++export GAD_TRAIN_DATASET=${GAD_TRAIN_DATASET:-${GAD_BASE_DATASET%.parquet}-gad.parquet}   # output (with teacher_response)
++export TEACHER_GEN_N=${TEACHER_GEN_N:-2000}              # #prompts to generate/keep (0 = all rows)
++export TEACHER_GEN_MAX_TOKENS=${TEACHER_GEN_MAX_TOKENS:-4096}
++export TEACHER_GEN_TP=${TEACHER_GEN_TP:-4}               # vLLM tensor-parallel for the (large) teacher
++export FORCE_REBUILD_TEACHER=${FORCE_REBUILD_TEACHER:-0}
++
++if [ ! -f "$GAD_TRAIN_DATASET" ] || [ "$FORCE_REBUILD_TEACHER" = "1" ]; then
++    echo "[GAD step0] building teacher_response -> $GAD_TRAIN_DATASET"
++    echo "[GAD step0]   teacher=$TEACHER_MODEL_PATH  base=$GAD_BASE_DATASET  n=$TEACHER_GEN_N  tp=$TEACHER_GEN_TP"
++    python3 "$SCRIPT_DIR/build_teacher_response_parquet.py" \
++        --in  "$GAD_BASE_DATASET" \
++        --out "$GAD_TRAIN_DATASET" \
++        --teacher "$TEACHER_MODEL_PATH" \
++        --n "$TEACHER_GEN_N" \
++        --max-tokens "$TEACHER_GEN_MAX_TOKENS" \
++        --tp "$TEACHER_GEN_TP"
++else
++    echo "[GAD step0] teacher_response parquet already exists, skip build: $GAD_TRAIN_DATASET"
++    echo "[GAD step0]   (set FORCE_REBUILD_TEACHER=1 to regenerate)"
++fi
++
++# Inject model paths + generated train data as Hydra overrides. These beat on_policy's
++# hardcoded ACTOR/REWARD paths (env can't override those — they are reassigned there).
++# User-supplied "$@" comes last, so it still wins over these defaults.
++exec bash "$SCRIPT_DIR/on_policy_distillation.sh" \
++    actor_rollout_ref.model.path="$STUDENT_MODEL_PATH" \
++    reward_model.model.path="$TEACHER_MODEL_PATH" \
++    critic.model.path="$DISCRIMINATOR_MODEL_PATH" \
++    reward_model.model.fsdp_config.param_offload="${TEACHER_PARAM_OFFLOAD:-True}" \
++    data.train_files="$GAD_TRAIN_DATASET" \
++    "$@"
 diff --git a/on_policy_distillation.sh b/on_policy_distillation.sh
-index f703198..b0e6321 100644
+index f703198..f30daa9 100644
 --- a/on_policy_distillation.sh
 +++ b/on_policy_distillation.sh
-@@ -39,11 +39,11 @@ export PROJECT_NAME='OnPolicyDistillation' # TODO
- export TORCH_NCCL_BLOCKING_WAIT=1
- export NCCL_TIMEOUT=7200
- export TORCH_DISTRIBUTED_DEBUG=INFO
--export ADV_ESTIMATOR=token_reward_direct
-+export ADV_ESTIMATOR=${ADV_ESTIMATOR:-token_reward_direct}
- # export ADV_ESTIMATOR=token_reward_direct_plus_grpo
- # export ADV_ESTIMATOR=token_grpo
- # export ADV_ESTIMATOR=grpo
--export GRPO_OUTCOME_WEIGHT=1.0
-+export GRPO_OUTCOME_WEIGHT=${GRPO_OUTCOME_WEIGHT:-1.0}
- # export ADV_ESTIMATOR=token_grpo
- # Swanlab setting used to continue exp  
- # export SWANLAB_RESUME=must
-@@ -51,15 +51,15 @@ export GRPO_OUTCOME_WEIGHT=1.0
- 
+@@ -52,14 +52,14 @@ export GRPO_OUTCOME_WEIGHT=1.0
  
  # DeepMath-103K
--export MAX_PROMPT_LENGTH=2048
+ export MAX_PROMPT_LENGTH=2048
 -export MAX_RESP_LENGTH=16384  # TODO: 31744 /15360 / 7168 / 3072 / 5120
 -export MAX_VAL_RESP_LENGTH=15360 # TODO: 15360 / 7168 / 3072
-+export MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 +export MAX_RESP_LENGTH=${MAX_RESP_LENGTH:-16384}  # TODO: 31744 /15360 / 7168 / 3072 / 5120
-+export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-15360} # TODO: 15360 / 7168 / 3072
++export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-8192} # TODO: 15360 / 7168 / 3072 (env-overridable)
  export MAX_MODEL_LEN=$(( MAX_RESP_LENGTH + MAX_PROMPT_LENGTH > MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ? MAX_RESP_LENGTH + MAX_PROMPT_LENGTH : MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ))
  export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-8} # TODO: 1 / 8 / 16 / 32 / 64 (default 64)
  export TEMPERATURE=${TEMPERATURE:-1.0} # TODO: 0.6 / 0.8 / 1.0 / 1.2 (default 1.0)
@@ -36,50 +619,37 @@ index f703198..b0e6321 100644
  export LOG_PROB_TOP_K=${LOG_PROB_TOP_K:-16} # 0 represents no top-k sampling
  export TOP_K_STRATEGY=${TOP_K_STRATEGY:-"only_stu"} # "only_stu" or "only_tch" or "intersection" or "union" or "union-intersection"
  export REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-"student_p"} # "student_p" or "teacher_p" or "none"
-@@ -103,7 +103,7 @@ export ATT_DISTILLATION_TEMPERATURE=${ATT_DISTILLATION_TEMPERATURE:-1.0}
+@@ -103,7 +103,8 @@ export ATT_DISTILLATION_TEMPERATURE=${ATT_DISTILLATION_TEMPERATURE:-1.0}
  # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/OpenThoughts3_opd.parquet
  # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/sampled_complement_30k.parquet
  # export TRAIN_DATASET=datasets/DeepMath-103K/verl_format/train_filtered_sampled.parquet
 -export TRAIN_DATASET=../datasets/dapo-math-17k.parquet
-+export TRAIN_DATASET=${TRAIN_DATASET:-../datasets/dapo-math-17k.parquet}
++export DATA_ROOT=${DATA_ROOT:-/dockerdata/junewluo/datasets}   # absolute -> works regardless of CWD / TARGET_DIR (.oprd)
++export TRAIN_DATASET=${TRAIN_DATASET:-${DATA_ROOT}/dapo-math-17k.parquet}
  # export TRAIN_DATASET=${DATA_DIR}/DeepMath-103K/train_filtered_level6.parquet
  # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/data/math-00000-of-00001.parquet
  # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/filtered/math-1p5b-filtered-diff-max8.parquet
-@@ -121,7 +121,7 @@ export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k}
+@@ -121,7 +122,7 @@ export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k}
  # export TRAIN_DATASET_NAME=OpenThoughts3-1.2M-opd
  # export TRAIN_DATASET_NAME=OpenThoughts3-1.2M-30k
  
 -export TEST_DATA_DIR=../datasets/test_data
-+export TEST_DATA_DIR=${TEST_DATA_DIR:-../datasets/test_data}
++export TEST_DATA_DIR=${TEST_DATA_DIR:-${DATA_ROOT}/test_data}
  # TRAIN_DATASET=${TRAIN_FILE:-["$DATA_DIR/$TASK/train_${SAMPLE_SIZE}.parquet"]}
  # TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME25/test.parquet", "$TEST_DATA_DIR/AMC23/test.parquet", "$TEST_DATA_DIR/AIME24/test.parquet"]}
  # TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME24/test.parquet"]}
-@@ -139,7 +139,7 @@ TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AMC23/test.parquet"]}
- # export ACTOR_MODEL_PATH=${MODEL_DIR}/Qwen3-4B
- # export ACTOR_MODEL_PATH=${MODEL_DIR}/DeepSeek-R1-Distill-Qwen-1.5B
- # export ACTOR_MODEL_PATH=${CKPT_DIR}/token_reward_direct_..._global_step_10_oprd_r8
--export ACTOR_MODEL_PATH=${MODEL_DIR}/Qwen3-1.7B-Base
-+export ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-${MODEL_DIR}/Qwen3-1.7B-Base}
- # export ACTOR_MODEL_PATH=${CKPT_DIR}/Qwen3-1.7B-Base-SFT-OpenThought3-4B/checkpoint-400
- # export ACTOR_MODEL_PATH=model/JustRL-DeepSeek-1.5B
- # export ACTOR_MODEL_PATH=model/Qwen3-1.7B-SFT
-@@ -162,13 +162,13 @@ export ACTOR_MODEL_NAME=$(basename "$ACTOR_MODEL_PATH")
- # export REWARD_MODEL_PATH=model/DeepSeek-R1-Distill-Qwen-14B
- # export REWARD_MODEL_PATH=${MODEL_DIR}/JustRL-DeepSeek-1.5B  
- # export REWARD_MODEL_PATH=${MODEL_DIR}/JustRL-DeepSeek-1.5B
--export REWARD_MODEL_PATH=${MODEL_DIR}/Qwen3-4B
-+export REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-${MODEL_DIR}/Qwen3-4B}
- # export REWARD_MODEL_PATH=${MODEL_DIR}/Phi-4-mini-reasoning
- 
- export REWARD_MODEL_NAME=$(basename "$REWARD_MODEL_PATH")
- 
- export PROJECT_PATH=${PROJECT_PATH:-./outputs}
--export PARALLEL_SIZE=1
-+export PARALLEL_SIZE=${PARALLEL_SIZE:-1}
- export CKPT_PATH=${PROJECT_PATH}/${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-$(date +%Y-%m-%d_%H-%M-%S)-OPD
- export OUTLINES_CACHE_DIR=~/.cache/outlines/$(uuidgen)
- export NCCL_DEBUG=WARN
-@@ -197,6 +197,36 @@ if [ "$LR_SCHEDULER" = "cosine" ]; then
+@@ -185,8 +186,8 @@ export EXPERIMENT_NAME=${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME
+ KL_ARGS=""
+ if [ "$USE_KL" = "True" ]; then
+     KL_ARGS="actor_rollout_ref.actor.use_kl_loss=True \
+-    actor_rollout_ref.actor.kl_loss_coef=0.005 \
+-    actor_rollout_ref.actor.kl_loss_type=low_var_kl"
++    actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF:-0.005} \
++    actor_rollout_ref.actor.kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}"
+ else
+     KL_ARGS="actor_rollout_ref.actor.use_kl_loss=False"
+ fi
+@@ -197,6 +198,45 @@ if [ "$LR_SCHEDULER" = "cosine" ]; then
      actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03"
  fi
  
@@ -95,12 +665,21 @@ index f703198..b0e6321 100644
 +export DISCRIMINATOR_MODEL_PATH=${DISCRIMINATOR_MODEL_PATH:-$ACTOR_MODEL_PATH}  # discriminator backbone
 +export CRITIC_LR=${CRITIC_LR:-1e-6}
 +export CRITIC_MICRO_BSZ=${CRITIC_MICRO_BSZ:-1}
++# GAN/GAIL stabilization tricks (default OFF -> existing GAD runs byte-for-byte unchanged):
++export GAD_REWARD_SHAPING=${GAD_REWARD_SHAPING:-raw}   # raw | gail  (Trick 1: bounded log-sigmoid reward)
++export GAD_D_GATE=${GAD_D_GATE:-False}                 # Trick 2: adaptive discriminator update gating
++export GAD_D_ACC_HI=${GAD_D_ACC_HI:-0.6}               # skip D update when last d_acc > this
++export GAD_D_MAX_SKIP=${GAD_D_MAX_SKIP:-5}             # failsafe: never skip D more than N times in a row
 +
 +GAD_ARGS=""
 +if [ "$USE_GAD_DISCRIMINATOR" = "True" ]; then
 +    GAD_ARGS="+actor_rollout_ref.actor.use_gad_discriminator=True \
 +    +actor_rollout_ref.actor.gad_coef=$GAD_COEF \
 +    +actor_rollout_ref.actor.gad_gate_pg=$GAD_GATE_PG \
++    +actor_rollout_ref.actor.gad_reward_shaping=$GAD_REWARD_SHAPING \
++    +actor_rollout_ref.actor.gad_d_gate=$GAD_D_GATE \
++    +actor_rollout_ref.actor.gad_d_acc_hi=$GAD_D_ACC_HI \
++    +actor_rollout_ref.actor.gad_d_max_skip=$GAD_D_MAX_SKIP \
 +    critic.enable=True \
 +    critic.strategy=fsdp \
 +    critic.use_gad_discriminator=True \
@@ -116,7 +695,7 @@ index f703198..b0e6321 100644
  PPO_MAX_TOKEN_LEN_PER_GPU=$(( ((1024 + MAX_RESP_LENGTH) > 32768) ? (1024 + MAX_RESP_LENGTH) : 32768))
  echo "PPO_MAX_TOKEN_LEN_PER_GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
  
-@@ -230,6 +260,7 @@ python3 -m verl.trainer.main_ppo \
+@@ -230,6 +270,7 @@ python3 -m verl.trainer.main_ppo \
      actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$PPO_MAX_TOKEN_LEN_PER_GPU \
      actor_rollout_ref.actor.ulysses_sequence_parallel_size=$PARALLEL_SIZE \
      $KL_ARGS \
@@ -124,16 +703,25 @@ index f703198..b0e6321 100644
      actor_rollout_ref.actor.loss_agg_mode=$LOSS_AGG_MODE \
      +actor_rollout_ref.actor.use_rep_distillation=$USE_REP_DISTILLATION \
      +actor_rollout_ref.actor.rep_distillation_coef=$REP_DISTILLATION_COEF \
-@@ -271,7 +302,7 @@ python3 -m verl.trainer.main_ppo \
-     +actor_rollout_ref.rollout.reward_weight_mode=$REWARD_WEIGHT_MODE \
-     +actor_rollout_ref.rollout.teacher_temperature=$TEACHER_TEMPERATURE \
-     actor_rollout_ref.rollout.tensor_model_parallel_size=$PARALLEL_SIZE \
--    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-+    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.8} \
-     actor_rollout_ref.rollout.max_model_len=$MAX_MODEL_LEN \
+@@ -276,7 +317,7 @@ python3 -m verl.trainer.main_ppo \
      actor_rollout_ref.rollout.n=$N_RESPONSES \
      actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-@@ -299,13 +330,14 @@ python3 -m verl.trainer.main_ppo \
+     +actor_rollout_ref.rollout.val_kwargs.max_tokens=$MAX_VAL_RESP_LENGTH \
+-    actor_rollout_ref.rollout.val_kwargs.n=16 \
++    actor_rollout_ref.rollout.val_kwargs.n=${VAL_N:-4} \
+     actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
+     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+     actor_rollout_ref.rollout.repetition_penalty=$REPETITION_PENALTY \
+@@ -290,7 +331,7 @@ python3 -m verl.trainer.main_ppo \
+     reward_model.model.fsdp_config.param_offload=False \
+     +reward_model.model.dtype=$MODEL_DTYPE \
+     reward_model.micro_batch_size_per_gpu=24 \
+-    custom_reward_function.path="verl/utils/reward_score/ttrl_math/__init__.py" \
++    custom_reward_function.path="verl/verl/utils/reward_score/ttrl_math/__init__.py" \
+     custom_reward_function.name=reward_func \
+     trainer.val_before_train=False \
+     trainer.log_val_generations=2 \
+@@ -299,13 +340,14 @@ python3 -m verl.trainer.main_ppo \
      trainer.project_name=$PROJECT_NAME \
      trainer.experiment_name=$EXPERIMENT_NAME \
      trainer.validation_data_dir=${PROJECT_PATH}/logs/validation_log/$EXPERIMENT_NAME \
@@ -143,7 +731,7 @@ index f703198..b0e6321 100644
 -    trainer.save_freq=200 \
 -    trainer.test_freq=2 \
 +    trainer.save_freq=${SAVE_FREQ:-200} \
-+    trainer.test_freq=${TEST_FREQ:-2} \
++    trainer.test_freq=${TEST_FREQ:-50} \
      trainer.total_epochs=1 \
      trainer.default_local_dir="$CKPT_PATH" \
      trainer.is_plot=$IS_PLOT \
@@ -151,6 +739,180 @@ index f703198..b0e6321 100644
  
  # Log the end time for local runs.
  if [ -z "$SLURM_JOB_ID" ]; then
+diff --git a/oprd_gad_pipline.md b/oprd_gad_pipline.md
+new file mode 100644
+index 0000000..c2ef590
+--- /dev/null
++++ b/oprd_gad_pipline.md
+@@ -0,0 +1,123 @@
++# oprd_gad_pipeline — 跑通 `gad_oprd_distillation.sh` 记录
++
++**结论:可以跑通。** conda 环境 `oprd_gad`,8× H20,仓库根 `/dockerdata/junewluo/OPRD`。
++已于 2026-07-15 完整跑通:`val_before_train` + 4 训练步,exit 0,无 OOM,GAD 判别器 / OPRD 表征 MSE / GRPO+KL 三条机制均在训练。
++
++`gad_oprd_distillation.sh` 本身只设置一批变量后 `exec` 到 `on_policy_distillation.sh`。它相对纯 OPD 额外开启:`USE_REP_DISTILLATION=True`(OPRD 表征 MSE)、`USE_GAD_DISCRIMINATOR=True`(判别器 critic)、`ADV_ESTIMATOR=grpo`、`USE_KL=True`、`LOG_PROB_TOP_K=0`。
++
++---
++
++## Debug 记录 (2026-07-17):集成 step0 后训练阶段崩溃
++
++集成 step0 + 32B→4B 配置后再跑,报「运行不成功」。定位与修复如下。
++
++| 项 | 内容 |
++|---|---|
++| **现象** | 加载完模型、抓完 CUDA graph 后,训练首个 batch 时崩溃退出(wrapper 误报 exit 0) |
++| **报错** | `NotImplementedError: Caught NotImplementedError in DataLoader worker process 0` → `sequence_length=4096 is larger than max_length=2048` |
++| **定位** | 报错在 **DataLoader**,`verl/verl/utils/dataset/rl_dataset.py:428-435`——对 `teacher_response` 做 `postprocess_data(max_length=max_response_length, truncation=self.truncation)` |
++| **根因** | step0 用 `TEACHER_GEN_MAX_TOKENS=4096` 生成 teacher_response,但训练把它强行塞进 `max_response_length` 且 `data.truncation='error'`。当 `MAX_RESP_LENGTH < teacher_response 长度` 时,`truncation='error'` 直接抛错而不是截断。(`truncation='error'` 本意是给 prompt 兜底,不该套在 teacher 参考回复上) |
++| **修复** | `rl_dataset.py:434` 把 teacher_response 的 `truncation=self.truncation` 改成固定 `truncation="right"`——teacher_response 只是判别器的参考正例,超长就截断(和学生回复一样按 max_response_length 截),永不 `error` |
++| **验证** | 用触发报错的同一配置(`MAX_RESP_LENGTH=2048`)重跑:旧报错 0 次复现,`global_step:1` 跑出完整指标,32B→4B 三机制均训练(`rep/teacher_hidden_dim=5120↔student=2560`、`teacher_layers=64↔36`、`critic/d_loss=0.55`、`pg_loss`/`kl_loss`),继续 step 2 |
++| **备注** | 改动在 `verl/verl/utils/dataset/rl_dataset.py`(该文件本就属 GAD 自定义实现的改动集)。另可选:让 `TEACHER_GEN_MAX_TOKENS ≤ MAX_RESP_LENGTH` 从源头避免超长 |
++
++**经验法则**:GAD 里 `teacher_response` 的生成长度(`TEACHER_GEN_MAX_TOKENS`)与训练 `MAX_RESP_LENGTH` 需协调;修复后即使不协调也只会截断、不再崩。
++
++### 修 bug#1 后又暴露的两个问题
++
++| # | 现象 | 根因 | 修复 |
++|---|---|---|---|
++| **bug#2 显存 OOM** | step1 跑完,step2 前 `Raylet is terminated ... system OOM killer`,进程被杀 | **系统内存(CPU RAM)爆掉**:step1 时 `cpu_memory 551GB`。驱动=32B 教师 `param_offload=True` 塞 CPU(64GB)+ OPRD rep-MSE 覆盖**全部 64 层 × last_k=2000** 的隐层张量(16×2000×64×5120 巨大) | 削减 rep 范围:`REP_DISTILLATION_LAYERS=last`、`REP_DISTILLATION_LAST_K=512`;教师不 offload(`TEACHER_PARAM_OFFLOAD=False`,32B 分片留 GPU 8GB/卡);`MINI_BATCH_SIZE=4`。→ CPU 降到 **395GB**,GPU 92.7/97GB,**3 步全部跑完**,~90-100s/step(原 464s) |
++| **bug#3 空模型路径** | `IndexError: string index out of range` @ `main_ppo.py:279 copy_to_local(actor.model.path)` | 我用**无前缀的 Hydra 覆盖** `actor_rollout_ref.actor.rep_distillation_layers=last`,与脚本里同名的 `+...` 覆盖冲突,导致 Hydra 组合异常、actor 路径解析为空 | 不走 Hydra 改 rep:把 `gad_oprd_distillation.sh` 里 `REP_DISTILLATION_LAST_K`/`REP_DISTILLATION_LAYERS` 改成 `${VAR:-默认}` 可环境变量覆盖,用 env 传(避免 dup-key) |
++
++**残留/注意**:即便降到 395GB,尾部仍出现一次 `DataLoader worker killed by signal: Killed`(prefetch 时 RAM 瞬时打满),3 步虽跑完但**CPU 内存仍逼近上限**。32B 白盒教师在本机(8×H20)属**内存受限**,长跑要更多余量:继续调小 `MINI_BATCH_SIZE`、`MAX_RESP_LENGTH`、`REP_DISTILLATION_LAST_K`,或减少 DataLoader worker 数。
++
++**能稳定跑通 step2 的最小验证配置**(bug#1/#2/#3 全部规避后):
++```bash
++export REP_DISTILLATION_LAYERS=last      # rep 只对最后一层(原 all=64 层)
++export REP_DISTILLATION_LAST_K=512       # 原 2000
++export TEACHER_PARAM_OFFLOAD=False       # 32B 留 GPU 分片,别塞 CPU
++export MODEL_DTYPE=bfloat16
++export MAX_RESP_LENGTH=2048 MAX_VAL_RESP_LENGTH=2048
++export N_RESPONSES=2 VAL_N=2 MINI_BATCH_SIZE=4 TEST_FREQ=100 SAVE_FREQ=100
++export TEST_FILE='["/dockerdata/junewluo/datasets/test_data/AIME24/test.parquet"]'
++bash gad_oprd_distillation.sh \
++  custom_reward_function.path=/dockerdata/junewluo/OPRD/verl/verl/utils/reward_score/ttrl_math/__init__.py \
++  trainer.val_before_train=False trainer.total_training_steps=3
++```
++
++---
++
++## 跑通过程中遇到的问题与解决方案
++
++| # | 类别 | 问题现象 | 根本原因 | 解决方案 |
++|---|---|---|---|---|
++| 1 | 环境(硬阻塞) | `import transformers`/`main_ppo` 崩溃:`AttributeError: module 'numpy' has no attribute 'long'` | 环境装了 scipy 1.18.0(要求 numpy≥2.0),但 numpy 锁定 1.26.4;scipy 1.18 用了 numpy 1.x 已删的 `np.long`,transformers 导入链(object-detection loss→scipy)被拖崩 | `pip install scipy==1.15.3`(兼容 numpy 1.26.4,py3.12)。**不要**升级 numpy |
++| 2 | 脚本路径 | 找不到 reward 函数 `verl/utils/reward_score/ttrl_math/__init__.py` | 仓库是 `OPRD/verl/verl/...` 双层结构,脚本写死路径少一层 `verl/` | 命令行覆盖 `custom_reward_function.path=/dockerdata/junewluo/OPRD/verl/verl/utils/reward_score/ttrl_math/__init__.py`(Hydra 取最后一个) |
++| 3 | 数据(验证集) | 默认验证集 `AMC23/test.parquet` 不存在 | `../datasets/test_data/` 下只有 `AIME24` | `export TEST_FILE='["/dockerdata/junewluo/datasets/test_data/AIME24/test.parquet"]'` |
++| 4 | 模型路径 | 找不到模型 | GAD 脚本默认 `MODEL_DIR=/workspace/model`(错) | `export MODEL_DIR=/dockerdata/junewluo/models` |
++| 5 | 数据(GAD 必需) | GAD 需要训练集含 `teacher_response` 文本列作判别器正例,原始/去重 parquet 都没有;文档提到的 `scripts/build_teacher_response_parquet.py` 也不存在 | GAD 判别器按 Bradley-Terry 训练(教师解答 > 学生解答),必须有教师解答文本 | 新写 `build_teacher_response_parquet.py`,用 Qwen3-4B(vLLM)对前 64 条 prompt 生成解答,以 Arrow 列追加,产出 `../datasets/dapo-math-17k-gad-mini.parquet`(64 行,schema 保留) |
++| 6 | 算法约束 | grpo 优势在 n=1 时退化(组内 std=0) | GAD 脚本用 `ADV_ESTIMATOR=grpo`(需组内多样本算基线) | `export N_RESPONSES=2`(≥2)。注:纯 OPD 用 `token_reward_direct` 时 n=1 可以 |
++| 7 | 显存 OOM | 之前 fp32 的 run 在验证时 Raylet 崩溃(`ActorUnavailableError` / OOM killer) | GAD 同时加载 3 个模型角色(student actor + Qwen3-4B 教师取隐层 + 判别器 critic),`MODEL_DTYPE=fp32` 极吃内存(step1 CPU 已 309GB),验证再叠加就爆 | `export MODEL_DTYPE=bfloat16`(显存减半,实测峰值 85/97GB 稳);并调小验证负载(见 #8) |
++| 8 | 验证开销/OOM | 验证一次极慢且吃内存 | 默认 `test_freq=2`(每 2 步验证)、`val_kwargs.n=16`、验证生成 15360 token | 把这三个改成可环境变量覆盖并调小:改 `on_policy_distillation.sh` 使 `MAX_VAL_RESP_LENGTH=${:-8192}`、`val_kwargs.n=${VAL_N:-4}`、`test_freq=${TEST_FREQ:-50}`;快速验证时进一步设小 |
++| 9 | 数据(冗余,非GAD特有) | 训练预处理要过滤 179 万条,`Total training steps` 高达 22 万 | `dapo-math-17k.parquet` 名字里 17k 是**唯一题数**,文件把每题重复了 ~100 次(179 万行) | `python3 dedup_train_parquet.py` 去重到 17,398 行(过滤 6s,2174 步/epoch) |
++| 10 | 绘图(非致命) | 日志出现 `ModuleNotFoundError: No module named 'swanlab'` + traceback | `IS_PLOT=True` 的散点图要上传 SwanLab,环境没装 swanlab(且 matplotlib 也需要) | 已 `pip install matplotlib`;swanlab 未装→报错被 try/except 吞掉,**不影响训练**。想要图再 `pip install swanlab` 并把 `trainer.logger` 加上 `swanlab` |
++| 11 | 评估指标误读 | 想看评估结果,但日志里全是 `val-topk/*`、`val-extrema/*` | 这些是 OPD/OPRD 每步记录的"学生/教师 top-k 分布重叠"内部指标,**不是**评估准确率 | 真正的评估准确率是 `val-core/<data_source>/acc/best@k/mean`(和 `maj@k/mean`),只在验证步产生;开 `trainer.val_before_train=True` 拿训练前 baseline 才能体现训练变化 |
++
++---
++
++## 最终可用启动命令(从仓库根目录)
++
++```bash
++cd /dockerdata/junewluo/OPRD
++conda activate oprd_gad
++
++export MODEL_DIR=/dockerdata/junewluo/models
++export MODEL_DTYPE=bfloat16          # 3 个模型角色,bf16 防 OOM
++export MAX_RESP_LENGTH=2048
++export MAX_VAL_RESP_LENGTH=2048
++export N_RESPONSES=2                  # grpo 必须 >=2
++export VAL_N=2
++export MINI_BATCH_SIZE=8
++export TEST_FREQ=2
++export SAVE_FREQ=10
++export TEST_FILE='["/dockerdata/junewluo/datasets/test_data/AIME24/test.parquet"]'
++
++bash gad_oprd_distillation.sh \
++  data.train_files=../datasets/dapo-math-17k-gad-mini.parquet \
++  custom_reward_function.path=/dockerdata/junewluo/OPRD/verl/verl/utils/reward_score/ttrl_math/__init__.py \
++  trainer.val_before_train=True \
++  trainer.total_training_steps=4
++```
++
++一次性环境修复:`pip install scipy==1.15.3 matplotlib`
++
++---
++
++## 前置产物(新建,均在仓库根目录,不在 verl/ 内)
++
++| 文件 | 用途 |
++|---|---|
++| `build_teacher_response_parquet.py` | 用教师模型生成 `teacher_response` 列(GAD 必需数据) |
++| `dedup_train_parquet.py` | DAPO 数据去重(179 万→1.7 万) |
++| `../datasets/dapo-math-17k-gad-mini.parquet` | GAD 快速验证数据(64 行,含 teacher_response) |
++| `RUN_NOTES_baseline_opd.md` | baseline_opd 跑通复盘 |
++
++---
++
++## 验证结果(2026-07-15,4 步,AIME24)
++
++| 验证点 | best@2 | maj@2 |
++|---|---|---|
++| step 0(训练前 baseline) | 0.00476 | 0.00313 |
++| step 2 | 0.01584 | 0.01149 |
++| step 4 | 0.02035 | 0.01408 |
++
++> ⚠️ 仅为"链路能出分、训练前后有变化"的快速验证:4 步 / 32 条训练数据 / AIME24 每题采 2 样本,绝对值小、噪声极大,**不构成有意义的效果结论**。
++
++三条机制均确认在训练:
++- **GAD 判别器**:`critic/d_loss`、`critic/d_acc`、`critic/student_score_mean`、`critic/teacher_score_mean`
++- **OPRD 表征 MSE 跨架构桥**:`actor/rep_loss`、`rep/low_rank=8`、student 28 层 ↔ teacher 36 层对齐
++- **GRPO + KL**:`actor/pg_loss`、`actor/kl_loss`
++
++结果日志:`./outputs/logs/terminal/<实验名>-OPD.log`;性能 ~130s/step,显存峰值 85/97GB。
+diff --git a/smoke_debug.sh b/smoke_debug.sh
+new file mode 100755
+index 0000000..7a94208
+--- /dev/null
++++ b/smoke_debug.sh
+@@ -0,0 +1,39 @@
++#!/bin/bash
++# ==============================================================================
++# Tiny single-GPU SMOKE + DEBUG run for OPRD+GAD.
++# Goal: exercise the full wiring (rollout -> teacher hidden states -> discriminator D(y)
++#       -> GRPO advantage + rep MSE -> actor/critic update) end-to-end in ~3 steps on 1 GPU,
++#       with post-mortem pdb on any worker exception. NOT for real training.
++#
++# Requires: a training parquet WITH a `teacher_response` column (see build_teacher_response_parquet.py).
++# Copy this next to on_policy_distillation.sh in the patched OPRD repo, then run it.
++# ------------------------------------------------------------------------------
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++# --- tiny footprint (env vars now honored by the patched on_policy_distillation.sh) ---
++export N_GPUS_PER_NODE=1
++export MAX_RESP_LENGTH=512
++export MAX_VAL_RESP_LENGTH=512
++export N_RESPONSES=2            # GRPO group size
++export MINI_BATCH_SIZE=2        # -> train_batch_size = 2 (PARALLEL_SIZE=1)
++export TEST_FREQ=100000         # skip periodic validation during the smoke
++export SAVE_FREQ=100000         # skip checkpointing
++
++# --- SMALL models (EDIT to the smallest you have; teacher != student is fine for cross-arch) ---
++export MODEL_DIR=${MODEL_DIR:-/workspace/model}
++export ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-${MODEL_DIR}/Qwen2.5-0.5B-Instruct}
++export REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-${MODEL_DIR}/Qwen2.5-0.5B-Instruct}
++export DISCRIMINATOR_MODEL_PATH=${DISCRIMINATOR_MODEL_PATH:-${ACTOR_MODEL_PATH}}
++export REP_LOW_RANK=${REP_LOW_RANK:-8}
++export GAD_COEF=${GAD_COEF:-0.5}
++
++# --- debugger: drop into pdb at the point of ANY exception inside a Ray worker ---
++export RAY_DEBUG_POST_MORTEM=1
++export HYDRA_FULL_ERROR=1
++
++# total_training_steps=3 is passed via the forwarded "$@" (the script does NOT set this key
++# itself, so there is no Hydra duplicate-key error). Append more overrides after it if needed.
++exec bash "$SCRIPT_DIR/gad_oprd_distillation.sh" \
++    trainer.total_training_steps=3 \
++    "$@"
 diff --git a/verl/verl/trainer/config/critic/critic.yaml b/verl/verl/trainer/config/critic/critic.yaml
 index f201a34..8fa7cde 100644
 --- a/verl/verl/trainer/config/critic/critic.yaml
@@ -210,7 +972,7 @@ index 5734eef..e018f18 100644
      """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
      kl penalty compute method for unbiased KL gradient estimation.
 diff --git a/verl/verl/trainer/ppo/ray_trainer.py b/verl/verl/trainer/ppo/ray_trainer.py
-index 1f54102..001a693 100644
+index 1f54102..fece8ea 100644
 --- a/verl/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/verl/trainer/ppo/ray_trainer.py
 @@ -527,6 +527,10 @@ class RayPPOTrainer:
@@ -241,7 +1003,7 @@ index 1f54102..001a693 100644
                              if self.config.reward_model.launch_reward_fn_async:
                                  future_reward = compute_reward_async.remote(
                                      data=batch, config=self.config, tokenizer=self.tokenizer
-@@ -1386,6 +1391,12 @@ class RayPPOTrainer:
+@@ -1386,6 +1391,26 @@ class RayPPOTrainer:
                              with marked_timer("values", timing_raw, color="cyan"):
                                  values = self.critic_wg.compute_values(batch)
                                  batch = batch.union(values)
@@ -250,12 +1012,62 @@ index 1f54102..001a693 100644
 +                                    # per-sequence score D(y_student) (nonzero only at the last
 +                                    # response token) IS the reward. Overrides any reward_fn.
 +                                    reward_tensor = batch.batch["values"]
++                                    # Trick 1 (GAN/GAIL): optional bounded reward shaping. Raw D(y) is
++                                    # unbounded and explodes when the discriminator saturates, destabilizing
++                                    # PG. GAIL-style log-sigmoid squashes it to (-inf, 0]. Only the last real
++                                    # response token is nonzero, so transform in place and keep zeros as zeros.
++                                    gad_reward_shaping = self.config.actor_rollout_ref.actor.get(
++                                        "gad_reward_shaping", "raw"
++                                    )
++                                    if gad_reward_shaping == "gail":
++                                        active = reward_tensor != 0
++                                        reward_tensor = torch.where(
++                                            active,
++                                            torch.nn.functional.logsigmoid(reward_tensor),
++                                            reward_tensor,
++                                        )
 +                                    reward_extra_infos_dict = {}
  
                          with marked_timer("adv", timing_raw, color="brown"):
                              # we combine with rule-based rm
+@@ -2300,10 +2325,31 @@ class RayPPOTrainer:
+ 
+                     # update critic
+                     if self.use_critic and not rep_distillation_only:
+-                        with marked_timer("update_critic", timing_raw, color="pink"):
+-                            critic_output = self.critic_wg.update_critic(batch)
+-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+-                        metrics.update(critic_output_metrics)
++                        # Trick 2 (GAN/GAIL): adaptive discriminator gating (TTUR-style) with a failsafe.
++                        # When the discriminator is too strong (last d_acc > hi) skip its update so the
++                        # generator can catch up — but never skip more than gad_d_max_skip times in a row,
++                        # so the discriminator can't be starved / go stale. Off by default (behavior
++                        # unchanged); the generator (actor) is never gated here, only the discriminator.
++                        do_update_critic = True
++                        if use_gad_discriminator and self.config.actor_rollout_ref.actor.get("gad_d_gate", False):
++                            d_acc_hi = float(self.config.actor_rollout_ref.actor.get("gad_d_acc_hi", 0.8))
++                            d_max_skip = int(self.config.actor_rollout_ref.actor.get("gad_d_max_skip", 5))
++                            last_d_acc = getattr(self, "_gad_last_d_acc", None)
++                            skip_count = getattr(self, "_gad_d_skip_count", 0)
++                            if last_d_acc is not None and last_d_acc > d_acc_hi and skip_count < d_max_skip:
++                                do_update_critic = False  # discriminator too strong -> let generator catch up
++                                self._gad_d_skip_count = skip_count + 1
++                            else:
++                                self._gad_d_skip_count = 0  # d_acc recovered, or failsafe -> force update
++                            metrics["gad/d_update_skipped"] = 0.0 if do_update_critic else 1.0
++                            metrics["gad/d_skip_count"] = float(self._gad_d_skip_count)
++                        if do_update_critic:
++                            with marked_timer("update_critic", timing_raw, color="pink"):
++                                critic_output = self.critic_wg.update_critic(batch)
++                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
++                            metrics.update(critic_output_metrics)
++                            if "critic/d_acc" in critic_output_metrics:
++                                self._gad_last_d_acc = critic_output_metrics["critic/d_acc"]
+ 
+                     # implement critic warmup
+                     if self.config.trainer.critic_warmup <= self.global_steps:
 diff --git a/verl/verl/utils/dataset/rl_dataset.py b/verl/verl/utils/dataset/rl_dataset.py
-index 870c475..6efc541 100644
+index 870c475..dde2135 100644
 --- a/verl/verl/utils/dataset/rl_dataset.py
 +++ b/verl/verl/utils/dataset/rl_dataset.py
 @@ -107,6 +107,7 @@ class RLHFDataset(Dataset):
@@ -291,7 +1103,7 @@ index 870c475..6efc541 100644
 +                max_length=self.max_response_length,
 +                pad_token_id=self.tokenizer.eos_token_id,  # response -> right-pad with eos
 +                left_pad=False,
-+                truncation=self.truncation,
++                truncation="right",  # teacher_response is a reference; truncate if > max_response_length (never 'error')
 +            )
 +            row_dict["teacher_response"] = teacher_response_ids[0].long()
 +
@@ -320,10 +1132,10 @@ index 11e5dcd..138811a 100644
                                  entropy_loss = agg_loss(
                                      loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
 diff --git a/verl/verl/workers/config/actor.py b/verl/verl/workers/config/actor.py
-index caf74e4..1dcb99f 100644
+index caf74e4..03eb2fc 100644
 --- a/verl/verl/workers/config/actor.py
 +++ b/verl/verl/workers/config/actor.py
-@@ -164,6 +164,12 @@ class ActorConfig(BaseConfig):
+@@ -164,6 +164,17 @@ class ActorConfig(BaseConfig):
      att_distillation_max_key_len: int = 4096
      att_distillation_loss: str = "kl"
      att_distillation_temperature: float = 1.0
@@ -333,6 +1145,11 @@ index caf74e4..1dcb99f 100644
 +    use_gad_discriminator: bool = False
 +    gad_coef: float = 1.0
 +    gad_gate_pg: bool = True
++    # GAN/GAIL stabilization tricks (default off -> behavior unchanged):
++    gad_reward_shaping: str = "raw"   # "raw" | "gail" (bounded log-sigmoid reward)
++    gad_d_gate: bool = False          # adaptive discriminator update gating
++    gad_d_acc_hi: float = 0.6         # skip discriminator update when last d_acc > this
++    gad_d_max_skip: int = 5           # failsafe: never skip discriminator more than N steps in a row
      profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
      engine: BaseConfig = field(default_factory=BaseConfig)
      data_loader_seed = 1

@@ -39,11 +39,11 @@ export PROJECT_NAME='OnPolicyDistillation' # TODO
 export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_TIMEOUT=7200
 export TORCH_DISTRIBUTED_DEBUG=INFO
-export ADV_ESTIMATOR=${ADV_ESTIMATOR:-token_reward_direct}
+export ADV_ESTIMATOR=token_reward_direct
 # export ADV_ESTIMATOR=token_reward_direct_plus_grpo
 # export ADV_ESTIMATOR=token_grpo
 # export ADV_ESTIMATOR=grpo
-export GRPO_OUTCOME_WEIGHT=${GRPO_OUTCOME_WEIGHT:-1.0}
+export GRPO_OUTCOME_WEIGHT=1.0
 # export ADV_ESTIMATOR=token_grpo
 # Swanlab setting used to continue exp  
 # export SWANLAB_RESUME=must
@@ -51,9 +51,9 @@ export GRPO_OUTCOME_WEIGHT=${GRPO_OUTCOME_WEIGHT:-1.0}
 
 
 # DeepMath-103K
-export MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+export MAX_PROMPT_LENGTH=2048
 export MAX_RESP_LENGTH=${MAX_RESP_LENGTH:-16384}  # TODO: 31744 /15360 / 7168 / 3072 / 5120
-export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-15360} # TODO: 15360 / 7168 / 3072
+export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-8192} # TODO: 15360 / 7168 / 3072 (env-overridable)
 export MAX_MODEL_LEN=$(( MAX_RESP_LENGTH + MAX_PROMPT_LENGTH > MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ? MAX_RESP_LENGTH + MAX_PROMPT_LENGTH : MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ))
 export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-8} # TODO: 1 / 8 / 16 / 32 / 64 (default 64)
 export TEMPERATURE=${TEMPERATURE:-1.0} # TODO: 0.6 / 0.8 / 1.0 / 1.2 (default 1.0)
@@ -103,7 +103,8 @@ export ATT_DISTILLATION_TEMPERATURE=${ATT_DISTILLATION_TEMPERATURE:-1.0}
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/OpenThoughts3_opd.parquet
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/sampled_complement_30k.parquet
 # export TRAIN_DATASET=datasets/DeepMath-103K/verl_format/train_filtered_sampled.parquet
-export TRAIN_DATASET=${TRAIN_DATASET:-../datasets/dapo-math-17k.parquet}
+export DATA_ROOT=${DATA_ROOT:-/dockerdata/junewluo/datasets}   # absolute -> works regardless of CWD / TARGET_DIR (.oprd)
+export TRAIN_DATASET=${TRAIN_DATASET:-${DATA_ROOT}/dapo-math-17k.parquet}
 # export TRAIN_DATASET=${DATA_DIR}/DeepMath-103K/train_filtered_level6.parquet
 # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/data/math-00000-of-00001.parquet
 # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/filtered/math-1p5b-filtered-diff-max8.parquet
@@ -121,7 +122,7 @@ export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k}
 # export TRAIN_DATASET_NAME=OpenThoughts3-1.2M-opd
 # export TRAIN_DATASET_NAME=OpenThoughts3-1.2M-30k
 
-export TEST_DATA_DIR=${TEST_DATA_DIR:-../datasets/test_data}
+export TEST_DATA_DIR=${TEST_DATA_DIR:-${DATA_ROOT}/test_data}
 # TRAIN_DATASET=${TRAIN_FILE:-["$DATA_DIR/$TASK/train_${SAMPLE_SIZE}.parquet"]}
 # TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME25/test.parquet", "$TEST_DATA_DIR/AMC23/test.parquet", "$TEST_DATA_DIR/AIME24/test.parquet"]}
 # TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME24/test.parquet"]}
@@ -139,7 +140,7 @@ TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AMC23/test.parquet"]}
 # export ACTOR_MODEL_PATH=${MODEL_DIR}/Qwen3-4B
 # export ACTOR_MODEL_PATH=${MODEL_DIR}/DeepSeek-R1-Distill-Qwen-1.5B
 # export ACTOR_MODEL_PATH=${CKPT_DIR}/token_reward_direct_..._global_step_10_oprd_r8
-export ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-${MODEL_DIR}/Qwen3-1.7B-Base}
+export ACTOR_MODEL_PATH=${MODEL_DIR}/Qwen3-1.7B-Base
 # export ACTOR_MODEL_PATH=${CKPT_DIR}/Qwen3-1.7B-Base-SFT-OpenThought3-4B/checkpoint-400
 # export ACTOR_MODEL_PATH=model/JustRL-DeepSeek-1.5B
 # export ACTOR_MODEL_PATH=model/Qwen3-1.7B-SFT
@@ -162,13 +163,13 @@ export ACTOR_MODEL_NAME=$(basename "$ACTOR_MODEL_PATH")
 # export REWARD_MODEL_PATH=model/DeepSeek-R1-Distill-Qwen-14B
 # export REWARD_MODEL_PATH=${MODEL_DIR}/JustRL-DeepSeek-1.5B  
 # export REWARD_MODEL_PATH=${MODEL_DIR}/JustRL-DeepSeek-1.5B
-export REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-${MODEL_DIR}/Qwen3-4B}
+export REWARD_MODEL_PATH=${MODEL_DIR}/Qwen3-4B
 # export REWARD_MODEL_PATH=${MODEL_DIR}/Phi-4-mini-reasoning
 
 export REWARD_MODEL_NAME=$(basename "$REWARD_MODEL_PATH")
 
 export PROJECT_PATH=${PROJECT_PATH:-./outputs}
-export PARALLEL_SIZE=${PARALLEL_SIZE:-1}
+export PARALLEL_SIZE=1
 export CKPT_PATH=${PROJECT_PATH}/${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-$(date +%Y-%m-%d_%H-%M-%S)-OPD
 export OUTLINES_CACHE_DIR=~/.cache/outlines/$(uuidgen)
 export NCCL_DEBUG=WARN
@@ -185,8 +186,8 @@ export EXPERIMENT_NAME=${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME
 KL_ARGS=""
 if [ "$USE_KL" = "True" ]; then
     KL_ARGS="actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.005 \
-    actor_rollout_ref.actor.kl_loss_type=low_var_kl"
+    actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF:-0.005} \
+    actor_rollout_ref.actor.kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}"
 else
     KL_ARGS="actor_rollout_ref.actor.use_kl_loss=False"
 fi
@@ -209,12 +210,21 @@ export GAD_GATE_PG=${GAD_GATE_PG:-True}                            # False -> re
 export DISCRIMINATOR_MODEL_PATH=${DISCRIMINATOR_MODEL_PATH:-$ACTOR_MODEL_PATH}  # discriminator backbone
 export CRITIC_LR=${CRITIC_LR:-1e-6}
 export CRITIC_MICRO_BSZ=${CRITIC_MICRO_BSZ:-1}
+# GAN/GAIL stabilization tricks (default OFF -> existing GAD runs byte-for-byte unchanged):
+export GAD_REWARD_SHAPING=${GAD_REWARD_SHAPING:-raw}   # raw | gail  (Trick 1: bounded log-sigmoid reward)
+export GAD_D_GATE=${GAD_D_GATE:-False}                 # Trick 2: adaptive discriminator update gating
+export GAD_D_ACC_HI=${GAD_D_ACC_HI:-0.6}               # skip D update when last d_acc > this
+export GAD_D_MAX_SKIP=${GAD_D_MAX_SKIP:-5}             # failsafe: never skip D more than N times in a row
 
 GAD_ARGS=""
 if [ "$USE_GAD_DISCRIMINATOR" = "True" ]; then
     GAD_ARGS="+actor_rollout_ref.actor.use_gad_discriminator=True \
     +actor_rollout_ref.actor.gad_coef=$GAD_COEF \
     +actor_rollout_ref.actor.gad_gate_pg=$GAD_GATE_PG \
+    +actor_rollout_ref.actor.gad_reward_shaping=$GAD_REWARD_SHAPING \
+    +actor_rollout_ref.actor.gad_d_gate=$GAD_D_GATE \
+    +actor_rollout_ref.actor.gad_d_acc_hi=$GAD_D_ACC_HI \
+    +actor_rollout_ref.actor.gad_d_max_skip=$GAD_D_MAX_SKIP \
     critic.enable=True \
     critic.strategy=fsdp \
     critic.use_gad_discriminator=True \
@@ -302,12 +312,12 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.reward_weight_mode=$REWARD_WEIGHT_MODE \
     +actor_rollout_ref.rollout.teacher_temperature=$TEACHER_TEMPERATURE \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$PARALLEL_SIZE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.8} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.max_model_len=$MAX_MODEL_LEN \
     actor_rollout_ref.rollout.n=$N_RESPONSES \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     +actor_rollout_ref.rollout.val_kwargs.max_tokens=$MAX_VAL_RESP_LENGTH \
-    actor_rollout_ref.rollout.val_kwargs.n=16 \
+    actor_rollout_ref.rollout.val_kwargs.n=${VAL_N:-4} \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.repetition_penalty=$REPETITION_PENALTY \
@@ -321,7 +331,7 @@ python3 -m verl.trainer.main_ppo \
     reward_model.model.fsdp_config.param_offload=False \
     +reward_model.model.dtype=$MODEL_DTYPE \
     reward_model.micro_batch_size_per_gpu=24 \
-    custom_reward_function.path="verl/utils/reward_score/ttrl_math/__init__.py" \
+    custom_reward_function.path="verl/verl/utils/reward_score/ttrl_math/__init__.py" \
     custom_reward_function.name=reward_func \
     trainer.val_before_train=False \
     trainer.log_val_generations=2 \
@@ -333,7 +343,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE:-8} \
     trainer.nnodes=1 \
     trainer.save_freq=${SAVE_FREQ:-200} \
-    trainer.test_freq=${TEST_FREQ:-2} \
+    trainer.test_freq=${TEST_FREQ:-50} \
     trainer.total_epochs=1 \
     trainer.default_local_dir="$CKPT_PATH" \
     trainer.is_plot=$IS_PLOT \
