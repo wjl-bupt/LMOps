@@ -39,11 +39,11 @@ export PROJECT_NAME='OnPolicyDistillation' # TODO
 export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_TIMEOUT=7200
 export TORCH_DISTRIBUTED_DEBUG=INFO
-export ADV_ESTIMATOR=token_reward_direct
+export ADV_ESTIMATOR=${ADV_ESTIMATOR:-token_reward_direct}
 # export ADV_ESTIMATOR=token_reward_direct_plus_grpo
 # export ADV_ESTIMATOR=token_grpo
 # export ADV_ESTIMATOR=grpo
-export GRPO_OUTCOME_WEIGHT=1.0
+export GRPO_OUTCOME_WEIGHT=${GRPO_OUTCOME_WEIGHT:-1.0}
 # export ADV_ESTIMATOR=token_grpo
 # Swanlab setting used to continue exp  
 # export SWANLAB_RESUME=must
@@ -51,9 +51,9 @@ export GRPO_OUTCOME_WEIGHT=1.0
 
 
 # DeepMath-103K
-export MAX_PROMPT_LENGTH=2048
+export MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 export MAX_RESP_LENGTH=${MAX_RESP_LENGTH:-16384}  # TODO: 31744 /15360 / 7168 / 3072 / 5120
-export MAX_VAL_RESP_LENGTH=15360 # TODO: 15360 / 7168 / 3072
+export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-15360} # TODO: 15360 / 7168 / 3072
 export MAX_MODEL_LEN=$(( MAX_RESP_LENGTH + MAX_PROMPT_LENGTH > MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ? MAX_RESP_LENGTH + MAX_PROMPT_LENGTH : MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ))
 export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-8} # TODO: 1 / 8 / 16 / 32 / 64 (default 64)
 export TEMPERATURE=${TEMPERATURE:-1.0} # TODO: 0.6 / 0.8 / 1.0 / 1.2 (default 1.0)
@@ -103,7 +103,7 @@ export ATT_DISTILLATION_TEMPERATURE=${ATT_DISTILLATION_TEMPERATURE:-1.0}
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/OpenThoughts3_opd.parquet
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/sampled_complement_30k.parquet
 # export TRAIN_DATASET=datasets/DeepMath-103K/verl_format/train_filtered_sampled.parquet
-export TRAIN_DATASET=../datasets/dapo-math-17k.parquet
+export TRAIN_DATASET=${TRAIN_DATASET:-../datasets/dapo-math-17k.parquet}
 # export TRAIN_DATASET=${DATA_DIR}/DeepMath-103K/train_filtered_level6.parquet
 # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/data/math-00000-of-00001.parquet
 # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/filtered/math-1p5b-filtered-diff-max8.parquet
@@ -121,7 +121,7 @@ export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k}
 # export TRAIN_DATASET_NAME=OpenThoughts3-1.2M-opd
 # export TRAIN_DATASET_NAME=OpenThoughts3-1.2M-30k
 
-export TEST_DATA_DIR=../datasets/test_data
+export TEST_DATA_DIR=${TEST_DATA_DIR:-../datasets/test_data}
 # TRAIN_DATASET=${TRAIN_FILE:-["$DATA_DIR/$TASK/train_${SAMPLE_SIZE}.parquet"]}
 # TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME25/test.parquet", "$TEST_DATA_DIR/AMC23/test.parquet", "$TEST_DATA_DIR/AIME24/test.parquet"]}
 # TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME24/test.parquet"]}
@@ -139,7 +139,7 @@ TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AMC23/test.parquet"]}
 # export ACTOR_MODEL_PATH=${MODEL_DIR}/Qwen3-4B
 # export ACTOR_MODEL_PATH=${MODEL_DIR}/DeepSeek-R1-Distill-Qwen-1.5B
 # export ACTOR_MODEL_PATH=${CKPT_DIR}/token_reward_direct_..._global_step_10_oprd_r8
-export ACTOR_MODEL_PATH=${MODEL_DIR}/Qwen3-1.7B-Base
+export ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-${MODEL_DIR}/Qwen3-1.7B-Base}
 # export ACTOR_MODEL_PATH=${CKPT_DIR}/Qwen3-1.7B-Base-SFT-OpenThought3-4B/checkpoint-400
 # export ACTOR_MODEL_PATH=model/JustRL-DeepSeek-1.5B
 # export ACTOR_MODEL_PATH=model/Qwen3-1.7B-SFT
@@ -162,13 +162,13 @@ export ACTOR_MODEL_NAME=$(basename "$ACTOR_MODEL_PATH")
 # export REWARD_MODEL_PATH=model/DeepSeek-R1-Distill-Qwen-14B
 # export REWARD_MODEL_PATH=${MODEL_DIR}/JustRL-DeepSeek-1.5B  
 # export REWARD_MODEL_PATH=${MODEL_DIR}/JustRL-DeepSeek-1.5B
-export REWARD_MODEL_PATH=${MODEL_DIR}/Qwen3-4B
+export REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-${MODEL_DIR}/Qwen3-4B}
 # export REWARD_MODEL_PATH=${MODEL_DIR}/Phi-4-mini-reasoning
 
 export REWARD_MODEL_NAME=$(basename "$REWARD_MODEL_PATH")
 
 export PROJECT_PATH=${PROJECT_PATH:-./outputs}
-export PARALLEL_SIZE=1
+export PARALLEL_SIZE=${PARALLEL_SIZE:-1}
 export CKPT_PATH=${PROJECT_PATH}/${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-$(date +%Y-%m-%d_%H-%M-%S)-OPD
 export OUTLINES_CACHE_DIR=~/.cache/outlines/$(uuidgen)
 export NCCL_DEBUG=WARN
@@ -302,7 +302,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.reward_weight_mode=$REWARD_WEIGHT_MODE \
     +actor_rollout_ref.rollout.teacher_temperature=$TEACHER_TEMPERATURE \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$PARALLEL_SIZE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.8} \
     actor_rollout_ref.rollout.max_model_len=$MAX_MODEL_LEN \
     actor_rollout_ref.rollout.n=$N_RESPONSES \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \

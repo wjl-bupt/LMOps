@@ -76,6 +76,9 @@ pip install math-verify
 pip install -e . --no-deps                               # make `verl` importable for `python -m verl.trainer.main_ppo`
 cd ..
 
+# if run bash go to wrong, you can try this. if the raise error is cause by environment .
+# pip install scipy==1.15.3、pip install matplotlib
+
 # 3. Model & data paths
 export MODEL_DIR=/path/to/models
 export DATA_DIR=/path/to/datasets
@@ -159,6 +162,31 @@ bash gad_oprd_distillation.sh
 bash baseline_oprd_only.sh
 bash baseline_opd.sh
 ```
+
+### Configuration & env overrides
+
+**Every setting is env-overridable with sensible defaults** — no need to edit the scripts:
+```bash
+MODEL_DIR=/models ACTOR_MODEL_PATH=/models/Qwen3-1.7B-Base REWARD_MODEL_PATH=/models/Qwen3-4B \
+TRAIN_DATASET=../datasets/dapo-math-17k-gad.parquet \
+TEST_FILE='["../datasets/test_data/AIME24/test.parquet"]' \
+N_GPUS_PER_NODE=8 GAD_COEF=0.5 REP_LOW_RANK=8 MAX_RESP_LENGTH=8192 \
+bash gad_oprd_distillation.sh
+```
+Common knobs: **models** `MODEL_DIR / ACTOR_MODEL_PATH / REWARD_MODEL_PATH / DISCRIMINATOR_MODEL_PATH`;
+**data** `TRAIN_DATASET / TEST_FILE / TEST_DATA_DIR`; **resources** `N_GPUS_PER_NODE / PARALLEL_SIZE (tp) /
+GPU_MEMORY_UTILIZATION / MINI_BATCH_SIZE / N_RESPONSES / MAX_RESP_LENGTH / MAX_PROMPT_LENGTH`; **OPRD**
+`REP_DISTILLATION_COEF / REP_DISTILLATION_LAYERS / REP_DISTILLATION_POSITIONS / REP_DISTILLATION_LAST_K /
+REP_LOW_RANK / REP_PROJECTOR_MODE / REP_FREEZE_PS`; **GAD** `GAD_COEF / GAD_GATE_PG / CRITIC_LR / CRITIC_MICRO_BSZ`;
+**quick test** `TOTAL_TRAINING_STEPS / TEST_FREQ / SAVE_FREQ`.
+
+Each launcher fixes only its **identity switches** (`USE_GAD_DISCRIMINATOR`, `USE_REP_DISTILLATION`,
+`REP_DISTILLATION_ONLY`, `ADV_ESTIMATOR`) — to switch method, pick a different launcher, not an env var.
+Because everything else is env-driven, **unset stale vars (or use a fresh shell) when switching methods**.
+
+> Fixed in this delivery: `on_policy_distillation.sh` previously **hard-set** `ADV_ESTIMATOR`, model paths,
+> `TRAIN_DATASET`, etc., which silently clobbered wrapper/env values (e.g. the combined run would have
+> reverted to `token_reward_direct` instead of `grpo`). These are now `${VAR:-default}`.
 
 ## Debugging
 

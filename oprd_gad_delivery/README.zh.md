@@ -157,6 +157,32 @@ bash baseline_oprd_only.sh
 bash baseline_opd.sh
 ```
 
+### 配置 & 环境变量覆盖
+
+**所有设置都能用环境变量覆盖(有合理默认值)**——不用改脚本:
+```bash
+MODEL_DIR=/models ACTOR_MODEL_PATH=/models/Qwen3-1.7B-Base REWARD_MODEL_PATH=/models/Qwen3-4B \
+TRAIN_DATASET=../datasets/dapo-math-17k-gad.parquet \
+TEST_FILE='["../datasets/test_data/AIME24/test.parquet"]' \
+N_GPUS_PER_NODE=8 GAD_COEF=0.5 REP_LOW_RANK=8 MAX_RESP_LENGTH=8192 \
+bash gad_oprd_distillation.sh
+```
+常用旋钮:**模型** `MODEL_DIR / ACTOR_MODEL_PATH / REWARD_MODEL_PATH / DISCRIMINATOR_MODEL_PATH`;
+**数据** `TRAIN_DATASET / TEST_FILE / TEST_DATA_DIR`;**资源** `N_GPUS_PER_NODE / PARALLEL_SIZE(tp) /
+GPU_MEMORY_UTILIZATION / MINI_BATCH_SIZE / N_RESPONSES / MAX_RESP_LENGTH / MAX_PROMPT_LENGTH`;
+**OPRD** `REP_DISTILLATION_COEF / REP_DISTILLATION_LAYERS / REP_DISTILLATION_POSITIONS /
+REP_DISTILLATION_LAST_K / REP_LOW_RANK / REP_PROJECTOR_MODE / REP_FREEZE_PS`;
+**GAD** `GAD_COEF / GAD_GATE_PG / CRITIC_LR / CRITIC_MICRO_BSZ`;
+**快速测试** `TOTAL_TRAINING_STEPS / TEST_FREQ / SAVE_FREQ`。
+
+每个启动脚本只固定自己的**身份开关**(`USE_GAD_DISCRIMINATOR`、`USE_REP_DISTILLATION`、
+`REP_DISTILLATION_ONLY`、`ADV_ESTIMATOR`)——要换方法请换启动脚本,而不是改环境变量。因为其它都由环境变量
+驱动,**切换方法时记得清掉旧的环境变量(或开新 shell)**。
+
+> 本次修复:`on_policy_distillation.sh` 之前**硬赋值**了 `ADV_ESTIMATOR`、模型路径、`TRAIN_DATASET` 等,
+> 会静默覆盖 wrapper/env 的值(例如组合运行会被退回成 `token_reward_direct` 而不是 `grpo`)。现在都改成了
+> `${VAR:-默认}`。
+
 ## 调试(Debugging)
 
 三层,由易到难。
